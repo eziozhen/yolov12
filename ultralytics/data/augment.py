@@ -1299,6 +1299,406 @@ class RandomPerspective:
         ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
         return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
 
+# --- 2. 时序 RandomPerspective (Affine) ---
+# YOLO 的 v8_transforms 经常把 LetterBox 作为 pre_transform 传给它
+class SequentialRandomPerspective(RandomPerspective):
+    """
+    Apply random perspective and affine transformations to a LIST of images with temporal consistency.
+    Inherits from RandomPerspective to reuse complex geometry logic.
+    """
+
+    def __call__(self, labels):
+        # 1. Pre-transform (通常是 SequentialLetterBox)
+        if self.pre_transform and "mosaic_border" not in labels:
+            labels = self.pre_transform(labels)
+        labels.pop("ratio_pad", None)
+
+        imgs = labels["img"] # List[np.ndarray]
+        cls = labels["cls"]
+        instances = labels.pop("instances")
+
+        # 2. 准备 Instance
+        # 使用第一帧的尺寸 (SequentialLetterBox 保证了所有帧尺寸一致)
+        h, w = imgs[0].shape[:2]
+        
+        instances.convert_bbox(format="xyxy")
+        instances.denormalize(*imgs[0].shape[:2][::-1])
+
+        # 3. 生成矩阵 M 并变换第一帧
+        border = labels.pop("mosaic_border", self.border)
+        
+        # 这一步设置 self.size，父类的 apply_segments/keypoints 需要用到
+        self.size = imgs[0].shape[1] + border[1] * 2, imgs[0].shape[0] + border[0] * 2  # target w, h
+
+        # 关键点：调用父类的 affine_transform 处理第一帧
+        # 这会自动执行随机参数生成 (Rotation, Shear, Translate...) 并返回矩阵 M
+        new_img0, M, scale = self.affine_transform(imgs[0], border)
+        
+        # 4. 使用同一个 M 变换剩余帧 (保证时序一致性)
+        new_imgs = [new_img0]
+        
+        # 判断是否需要 warp (逻辑复制自父类，避免 Identity 矩阵做无用功)
+        need_warp = (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any()
+
+        if len(imgs) > 1:
+            for img in imgs[1:]:
+                if need_warp:
+                    if self.perspective:
+                        cur_new = cv2.warpPerspective(img, M, dsize=self.size, borderValue=(114, 114, 114))
+                    else:
+                        cur_new = cv2.warpAffine(img, M[:2], dsize=self.size, borderValue=(114, 114, 114))
+                    new_imgs.append(cur_new)
+                else:
+                    new_imgs.append(img)
+
+        # 5. 变换 Annotations (直接复用父类方法)
+        # 因为所有帧的变换是一致的，且 Label 通常对应当前帧(或同轨迹)，所以直接变换即可
+        bboxes = self.apply_bboxes(instances.bboxes, M)
+
+        segments = instances.segments
+        keypoints = instances.keypoints
+        
+        if len(segments):
+            bboxes, segments = self.apply_segments(segments, M)
+
+        if keypoints is not None:
+            keypoints = self.apply_keypoints(keypoints, M)
+
+        # 6. Clip and Filter (直接复用父类逻辑)
+        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+        new_instances.clip(*self.size)
+
+        # 筛选候选框 (Box Candidates)
+        instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
+        
+        # 复用父类的静态方法 box_candidates
+        i = self.box_candidates(
+            box1=instances.bboxes.T, 
+            box2=new_instances.bboxes.T, 
+            area_thr=0.01 if len(segments) else 0.10
+        )
+        
+        # 7. 更新 Labels
+        labels["instances"] = new_instances[i]
+        labels["cls"] = cls[i]
+        labels["img"] = new_imgs  # 存入处理后的图片列表
+        labels["resized_shape"] = new_imgs[0].shape[:2]
+        
+        return labels
+
+# --- 3. 时序 HSV ---
+class SequentialRandomHSV:
+    def __init__(self, hgain=0.5, sgain=0.5, vgain=0.5):
+        self.hgain = hgain
+        self.sgain = sgain
+        self.vgain = vgain
+
+    def __call__(self, labels):
+        # 1. 获取输入 List
+        imgs = labels["img"]  # List[np.ndarray]
+        
+        # 2. 检查是否有增益参数 (与原版一致)
+        if self.hgain or self.sgain or self.vgain:
+            
+            # --- A. 生成随机增益 (全序列只生成一次) ---
+            # random gains: [h_gain, s_gain, v_gain]
+            r = np.random.uniform(-1, 1, 3) * [self.hgain, self.sgain, self.vgain] + 1
+            
+            # --- B. 预计算 LUT (全序列只计算一次) ---
+            # 使用第一帧的 dtype (通常是 uint8)
+            dtype = imgs[0].dtype  
+            
+            x = np.arange(0, 256, dtype=r.dtype)
+            
+            # 计算 Hue, Sat, Val 的映射表
+            lut_hue = ((x * r[0]) % 180).astype(dtype)
+            lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+            lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+            # --- C. 循环应用到每一帧 ---
+            # 原版是 in-place 修改 (dst=img)，这里我们也对 List 中的 array 做 in-place 修改
+            for img in imgs:
+                # 1. BGR -> HSV -> Split
+                hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+
+                # 2. 应用 LUT
+                # cv2.merge + cv2.LUT
+                im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+
+                # 3. HSV -> BGR (In-place update)
+                cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=img) 
+
+        return labels
+
+
+class SequentialRandomFlip:
+    """
+    Applies a random horizontal or vertical flip to a LIST of images with temporal consistency.
+    (Standalone version, no inheritance)
+    """
+
+    def __init__(self, p=0.5, direction="horizontal", flip_idx=None) -> None:
+        """
+        初始化逻辑完全复刻原版 RandomFlip，但不依赖原版类。
+        """
+        assert direction in {"horizontal", "vertical"}, f"Support direction `horizontal` or `vertical`, got {direction}"
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+
+        self.p = p
+        self.direction = direction
+        self.flip_idx = flip_idx
+
+    def __call__(self, labels):
+        # 1. 获取输入 List
+        imgs = labels["img"]  # List[np.ndarray]
+        instances = labels.pop("instances")
+        
+        # 2. 准备 Label 处理所需参数
+        instances.convert_bbox(format="xywh")
+        
+        # 从第一帧获取尺寸
+        h, w = imgs[0].shape[:2]
+        
+        # 归一化检查
+        h = 1 if instances.normalized else h
+        w = 1 if instances.normalized else w
+
+        # 3. 垂直翻转 (Flip up-down)
+        # 关键点：只随机一次 decision
+        if self.direction == "vertical" and random.random() < self.p:
+            # 显式循环处理每一帧
+            new_imgs = []
+            for img in imgs:
+                new_imgs.append(np.flipud(img))
+            imgs = new_imgs 
+            
+            # 处理 Instances (只处理一次)
+            instances.flipud(h)
+
+        # 4. 水平翻转 (Flip left-right)
+        # 关键点：只随机一次 decision
+        if self.direction == "horizontal" and random.random() < self.p:
+            # 显式循环处理每一帧
+            new_imgs = []
+            for img in imgs:
+                new_imgs.append(np.fliplr(img))
+            imgs = new_imgs 
+            
+            # 处理 Instances
+            instances.fliplr(w)
+            
+            # For keypoints
+            if self.flip_idx is not None and instances.keypoints is not None:
+                instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+
+        # 5. 封装返回
+        # 显式做 contiguous 处理
+        labels["img"] = [np.ascontiguousarray(img) for img in imgs]
+        labels["instances"] = instances
+        return labels
+
+class SequentialAlbumentations:
+    """
+    Albumentations transformations for image augmentation.
+
+    This class applies various image transformations using the Albumentations library. It includes operations such as
+    Blur, Median Blur, conversion to grayscale, Contrast Limited Adaptive Histogram Equalization (CLAHE), random changes
+    in brightness and contrast, RandomGamma, and image quality reduction through compression.
+
+    Attributes:
+        p (float): Probability of applying the transformations.
+        transform (albumentations.Compose): Composed Albumentations transforms.
+        contains_spatial (bool): Indicates if the transforms include spatial operations.
+
+    Methods:
+        __call__: Applies the Albumentations transformations to the input labels.
+
+    Examples:
+        >>> transform = Albumentations(p=0.5)
+        >>> augmented_labels = transform(labels)
+
+    Notes:
+        - The Albumentations package must be installed to use this class.
+        - If the package is not installed or an error occurs during initialization, the transform will be set to None.
+        - Spatial transforms are handled differently and require special processing for bounding boxes.
+    """
+
+    def __init__(self, p=1.0):
+        """
+        Initialize the Albumentations transform object for YOLO bbox formatted parameters.
+
+        This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
+        conversion to grayscale, Contrast Limited Adaptive Histogram Equalization, random changes of brightness and
+        contrast, RandomGamma, and image quality reduction through compression.
+
+        Args:
+            p (float): Probability of applying the augmentations. Must be between 0 and 1.
+
+        Attributes:
+            p (float): Probability of applying the augmentations.
+            transform (albumentations.Compose): Composed Albumentations transforms.
+            contains_spatial (bool): Indicates if the transforms include spatial transformations.
+
+        Raises:
+            ImportError: If the Albumentations package is not installed.
+            Exception: For any other errors during initialization.
+
+        Examples:
+            >>> transform = Albumentations(p=0.5)
+            >>> augmented = transform(image=image, bboxes=bboxes, class_labels=classes)
+            >>> augmented_image = augmented["image"]
+            >>> augmented_bboxes = augmented["bboxes"]
+
+        Notes:
+            - Requires Albumentations version 1.0.3 or higher.
+            - Spatial transforms are handled differently to ensure bbox compatibility.
+            - Some transforms are applied with very low probability (0.01) by default.
+        """
+        self.p = p
+        self.transform = None
+        self.A = None
+        prefix = colorstr("albumentations: ")
+
+        try:
+            import albumentations as A
+            
+            self.A = A
+
+            check_version(A.__version__, "1.0.3", hard=True)  # version requirement
+
+            # List of possible spatial transforms
+            spatial_transforms = {
+                "Affine",
+                "BBoxSafeRandomCrop",
+                "CenterCrop",
+                "CoarseDropout",
+                "Crop",
+                "CropAndPad",
+                "CropNonEmptyMaskIfExists",
+                "D4",
+                "ElasticTransform",
+                "Flip",
+                "GridDistortion",
+                "GridDropout",
+                "HorizontalFlip",
+                "Lambda",
+                "LongestMaxSize",
+                "MaskDropout",
+                "MixUp",
+                "Morphological",
+                "NoOp",
+                "OpticalDistortion",
+                "PadIfNeeded",
+                "Perspective",
+                "PiecewiseAffine",
+                "PixelDropout",
+                "RandomCrop",
+                "RandomCropFromBorders",
+                "RandomGridShuffle",
+                "RandomResizedCrop",
+                "RandomRotate90",
+                "RandomScale",
+                "RandomSizedBBoxSafeCrop",
+                "RandomSizedCrop",
+                "Resize",
+                "Rotate",
+                "SafeRotate",
+                "ShiftScaleRotate",
+                "SmallestMaxSize",
+                "Transpose",
+                "VerticalFlip",
+                "XYMasking",
+            }  # from https://albumentations.ai/docs/getting_started/transforms_and_targets/#spatial-level-transforms
+
+            # Transforms
+            T = [
+                A.Blur(p=0.01),
+                A.MedianBlur(p=0.01),
+                A.ToGray(p=0.01),
+                A.CLAHE(p=0.01),
+                A.RandomBrightnessContrast(p=0.0),
+                A.RandomGamma(p=0.0),
+                A.ImageCompression(quality_lower=75, p=0.0),
+            ]
+
+            # Compose transforms
+            self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
+            self.transform = (
+                A.ReplayCompose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                if self.contains_spatial
+                else A.ReplayCompose(T)
+            )
+            if hasattr(self.transform, "set_random_seed"):
+                # Required for deterministic transforms in albumentations>=1.4.21
+                self.transform.set_random_seed(torch.initial_seed())
+            LOGGER.info(prefix + ", ".join(f"{x}".replace("always_apply=False, ", "") for x in T if x.p))
+        except ImportError:  # package not installed, skip
+            pass
+        except Exception as e:
+            LOGGER.info(f"{prefix}{e}")
+
+    def __call__(self, labels):
+        # 1. 概率检查 (与原版一致)
+        if self.transform is None or random.random() > self.p:
+            return labels
+
+        imgs = labels["img"] # List[np.ndarray]
+        curr_img = imgs[-1]  # 取当前帧作为基准
+        
+        # 预定义 replay_params，如果没生成（比如进了 if len(cls) 失败的分支），后面就不执行回放
+        replay_params = None 
+        curr_img_aug = curr_img # 默认当前帧不改
+
+        # 2. 空间变换逻辑 (严格对齐原版)
+        if self.contains_spatial:
+            cls = labels["cls"]
+            if len(cls):  # 原版逻辑：只有当存在 Box 时才进行空间变换
+                im = curr_img
+                labels["instances"].convert_bbox("xywh")
+                labels["instances"].normalize(*im.shape[:2][::-1])
+                bboxes = labels["instances"].bboxes
+                
+                # --- 生成随机参数 (Record) ---
+                # 使用 ReplayCompose 调用，它会返回 data['replay']
+                data = self.transform(image=im, bboxes=bboxes, class_labels=cls)
+                
+                # 获取关键的 Replay 参数
+                replay_params = data["replay"]
+                
+                # 更新当前帧信息 (与原版一致)
+                if len(data["class_labels"]) > 0:
+                    curr_img_aug = data["image"]
+                    labels["cls"] = np.array(data["class_labels"])
+                    bboxes = np.array(data["bboxes"], dtype=np.float32)
+                else:
+                    replay_params = None
+                labels["instances"].update(bboxes=bboxes)
+        else:
+            # 3. 非空间变换逻辑 (严格对齐原版)
+            # --- 生成随机参数 (Record) ---
+            data = self.transform(image=curr_img)
+            replay_params = data["replay"]
+            curr_img_aug = data["image"]
+
+        # 4. 历史帧回放逻辑 (新增部分，为了适配 Video)
+        # 只有当成功生成了变换参数后 (replay_params is not None)，才处理历史帧
+        if replay_params is not None:
+            new_imgs_list = []
+
+            # 处理历史帧 (0 到 T-2)
+            for i in range(len(imgs) - 1):
+                # --- 关键：使用 replay ---
+                # 强行使用当前帧生成的参数，应用到历史帧
+                res = self.A.ReplayCompose.replay(replay_params, image=imgs[i])
+                new_imgs_list.append(res["image"])
+            
+            # 追加处理后的当前帧
+            new_imgs_list.append(curr_img_aug)
+            
+            # 更新 List
+            labels["img"] = new_imgs_list
+
+        return labels
 
 class RandomHSV:
     """
@@ -1630,6 +2030,114 @@ class LetterBox:
         labels["instances"].add_padding(padw, padh)
         return labels
 
+class SequentialLetterBox(LetterBox):
+    """
+    Resize image list and padding for detection, instance segmentation, pose.
+    (Sequential Version for Video Data)
+
+    This class resizes and pads a list of images to a specified shape while preserving aspect ratio. 
+    It ensures that all frames in the sequence undergo the EXACT same transformation (same ratio, same padding).
+    """
+
+    def __init__(self, new_shape=(640, 640), auto=False, scaleFill=False, scaleup=True, center=True, stride=32):
+        """
+        Initialize SequentialLetterBox object.
+        Args and Attributes are identical to the standard LetterBox.
+        """
+        super().__init__(new_shape, auto, scaleFill, scaleup, center, stride)
+
+    def __call__(self, labels=None, image=None):
+        """
+        Resizes and pads a LIST of images for video tasks.
+
+        Args:
+            labels (Dict | None): A dictionary containing 'img' (List[np.ndarray]) and associated labels.
+            image (List[np.ndarray] | None): The input image list. If None, the image is taken from 'labels'.
+
+        Returns:
+            (Dict | List): Updated dictionary with processed image list, or just the list if labels is empty.
+        """
+        if labels is None:
+            labels = {}
+        
+        # --- 1. 获取输入 (Expect List) ---
+        imgs = labels.get("img") if image is None else image
+        
+        # 使用第一帧来计算几何参数
+        shape = imgs[0].shape[:2]  # current shape [height, width]
+        
+        # --- 2. 计算参数 (完全复用原版逻辑) ---
+        new_shape = labels.pop("rect_shape", self.new_shape)
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+
+        # Scale ratio (new / old)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not self.scaleup:  # only scale down, do not scale up (for better val mAP)
+            r = min(r, 1.0)
+
+        # Compute padding
+        ratio = r, r  # width, height ratios
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+        if self.auto:  # minimum rectangle
+            dw, dh = np.mod(dw, self.stride), np.mod(dh, self.stride)  # wh padding
+        elif self.scaleFill:  # stretch
+            dw, dh = 0.0, 0.0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
+
+        if self.center:
+            dw /= 2  # divide padding into 2 sides
+            dh /= 2
+
+        # 预先计算好 padding 的上下左右距离
+        top, bottom = int(round(dh - 0.1)) if self.center else 0, int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)) if self.center else 0, int(round(dw + 0.1))
+
+        # --- 3. 循环处理每一帧 ---
+        new_imgs = []
+        for img in imgs:
+            if shape[::-1] != new_unpad:  # resize
+                img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+            # add border (使用固定的灰色 114)
+            img = cv2.copyMakeBorder(
+                img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+            )
+            new_imgs.append(img)
+
+        # --- 4. 更新 Labels ---
+        if labels.get("ratio_pad"):
+            labels["ratio_pad"] = (labels["ratio_pad"], (left, top))  # for evaluation
+
+        if len(labels):
+            # 调用更新 label 的逻辑
+            labels = self._update_labels(labels, ratio, left, top)
+            # 将 list 塞回去
+            labels["img"] = new_imgs
+            labels["resized_shape"] = new_shape
+            return labels
+        else:
+            return new_imgs
+
+    @staticmethod
+    def _update_labels(labels, ratio, padw, padh):
+        """
+        Updates labels after applying letterboxing.
+        
+        Args:
+            labels (Dict): labels['img'] is now a List[np.ndarray].
+        """
+        labels["instances"].convert_bbox(format="xyxy")
+        
+        # --- 修改点: 针对 List 数据结构获取尺寸 ---
+        # 原版: labels["img"].shape[:2][::-1]
+        # 修改版: labels["img"][0].shape[:2][::-1] (取第一帧的尺寸)
+        labels["instances"].denormalize(*labels["img"][0].shape[:2][::-1])
+        labels["instances"].scale(*ratio)
+        labels["instances"].add_padding(padw, padh)
+        return labels
 
 class CopyPaste(BaseMixTransform):
     """
@@ -2137,6 +2645,104 @@ class Format:
 
         return masks, instances, cls
 
+class SequentialFormat(Format):
+    """
+    针对 Video List 数据的格式化类，完全对齐原版 Format 的功能。
+    支持 List[np.array] -> Tensor (T, C, H, W)
+    支持 Masks, Keypoints, OBB, Normalize 等所有原版特性。
+    保证 BGR/RGB 转换在时序上的参数一致性。
+    """
+
+    def __call__(self, labels):
+        """
+        Args:
+            labels (Dict): 
+                - 'img': List[np.ndarray], 每个元素是 (H, W, C)
+                - 'cls': ...
+                - 'instances': ...
+        """
+        img_list = labels.pop("img")  # 这里取出来的是一个 list
+        
+        # 使用第一帧获取尺寸 (所有帧在前面的 LetterBox 中已经 resize 到一致了)
+        h, w = img_list[0].shape[:2]
+        
+        cls = labels.pop("cls")
+        instances = labels.pop("instances")
+        
+        # --- 1. 处理 Instances (Box, Segments, Keypoints) ---
+        # 逻辑与原版 Format 完全一致
+        instances.convert_bbox(format=self.bbox_format)
+        instances.denormalize(w, h)
+        nl = len(instances)
+
+        # --- 2. 处理 Masks (Segmentation) ---
+        if self.return_mask:
+            if nl:
+                masks, instances, cls = self._format_segments(instances, cls, w, h)
+                masks = torch.from_numpy(masks)
+            else:
+                masks = torch.zeros(
+                    1 if self.mask_overlap else nl, 
+                    img_list[0].shape[0] // self.mask_ratio, 
+                    img_list[0].shape[1] // self.mask_ratio
+                )
+            labels["masks"] = masks
+
+        # --- 3. 处理 Images (List -> Tensor) ---
+        # 关键修改点：时序一致性处理
+        
+        # A. 决定是否进行 BGR 转换 (针对整个序列只生成一次随机数)
+        do_bgr_flip = random.uniform(0, 1) > self.bgr
+        
+        # B. 循环处理每一帧
+        processed_imgs = []
+        for img in img_list:
+            # 调用修改后的单帧处理函数
+            processed_imgs.append(self._format_single_img(img, do_bgr_flip))
+            
+        # C. 堆叠: List[(C, H, W)] -> (T, C, H, W)
+        labels["img"] = torch.stack(processed_imgs, dim=0)
+
+        # --- 4. 处理 Labels (Cls, Bboxes, Keypoints, OBB) ---
+        # 逻辑与原版 Format 完全一致
+        
+        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
+        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        
+        if self.return_keypoint:
+            labels["keypoints"] = torch.from_numpy(instances.keypoints)
+            if self.normalize:
+                labels["keypoints"][..., 0] /= w
+                labels["keypoints"][..., 1] /= h
+                
+        if self.return_obb:
+            labels["bboxes"] = (
+                xyxyxyxy2xywhr(torch.from_numpy(instances.segments)) if len(instances.segments) else torch.zeros((0, 5))
+            )
+            
+        # Normalize OBB / BBox
+        if self.normalize:
+            labels["bboxes"][:, [0, 2]] /= w
+            labels["bboxes"][:, [1, 3]] /= h
+            
+        # Batch Index
+        if self.batch_idx:
+            labels["batch_idx"] = torch.zeros(nl)
+            
+        return labels
+
+    def _format_single_img(self, img, do_bgr_flip):
+        """
+        处理单帧图像，逻辑复刻原版 _format_img，但接受外部传入的翻转决策。
+        """
+        if len(img.shape) < 3:
+            img = np.expand_dims(img, -1)
+        img = img.transpose(2, 0, 1) # HWC -> CHW
+        
+        # 使用传入的 do_bgr_flip 及其参数，而不是在函数内随机
+        img = np.ascontiguousarray(img[::-1] if do_bgr_flip else img)
+        img = torch.from_numpy(img)
+        return img
 
 class RandomLoadText:
     """
@@ -2274,6 +2880,51 @@ class RandomLoadText:
         labels["texts"] = texts
         return labels
 
+def v8_video_transforms(dataset, imgsz, hyp, stretch=False):
+    """
+    针对 Video List 数据结构的增强工厂函数。
+    结构模仿 v8_transforms，但移除了马赛克/Mixup，并替换为 Sequential 类。
+    """
+
+    # 1. 基础几何变换 (LetterBox -> Affine)
+    # 注意：在 v8_transforms 里，LetterBox 被作为 pre_transform 塞进了 RandomPerspective
+    pre_transform = SequentialLetterBox(new_shape=(imgsz, imgsz)) if not stretch else None
+    
+    affine = SequentialRandomPerspective(
+        degrees=hyp.degrees,
+        translate=hyp.translate,
+        scale=hyp.scale,
+        shear=hyp.shear,
+        perspective=hyp.perspective,
+        pre_transform=pre_transform 
+    )
+
+    # 2. 组装 Pipeline
+    # 我们移除了 Mosaic/MixUp，因为它们会破坏由 List 维护的时序关系
+    # 如果你必须要有 Mosaic，需要写一个极其复杂的 SequentialMosaic
+    
+    t_list = [affine] # 基础几何
+
+    t_list.append(SequentialAlbumentations(p=1.0))
+    
+    # 3. 颜色增强
+    t_list.append(SequentialRandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v))
+    
+    # 4. 翻转
+    # flip_idx 用于关键点，如果没有关键点可以忽略
+    flip_idx = dataset.data.get("flip_idx", [])
+    if dataset.use_keypoints:
+        kpt_shape = dataset.data.get("kpt_shape", None)
+        if len(flip_idx) == 0 and hyp.fliplr > 0.0:
+            hyp.fliplr = 0.0
+            LOGGER.warning("WARNING ⚠️ No 'flip_idx' array defined in data.yaml, setting augmentation 'fliplr=0.0'")
+        elif flip_idx and (len(flip_idx) != kpt_shape[0]):
+            raise ValueError(f"data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}")
+
+    t_list.append(SequentialRandomFlip(direction="vertical", p=hyp.flipud))
+    t_list.append(SequentialRandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx))
+    
+    return Compose(t_list)
 
 def v8_transforms(dataset, imgsz, hyp, stretch=False):
     """

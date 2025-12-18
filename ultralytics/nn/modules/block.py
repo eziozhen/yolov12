@@ -11,6 +11,8 @@ from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
+    "MTI_Block",
+    "TemporalSlice",
     "DFL",
     "HGBlock",
     "HGStem",
@@ -52,6 +54,250 @@ __all__ = (
     "TorchVision",
 )
 
+class MTI_Block(nn.Module):
+    """
+    MTI-Net Block (Fixed Version)
+    """
+    def __init__(self, c1, c2, seq_len=5, num_heads=8):
+        super().__init__()
+        self.c1 = c1
+        self.seq_len = seq_len
+        self.embed_dim = c1 
+        
+        # 1. TCE: Position Perceiver (3D Conv)
+        self.pos_perceiver = nn.Conv3d(c1, c1, kernel_size=(1, 7, 7), 
+                                       padding=(0, 3, 3), groups=c1)
+        
+        # ★★★ 修复 1: 修正维度为 (1, T, C, 1, 1) 以支持广播加法 ★★★
+        self.temporal_embed = nn.Parameter(torch.zeros(1, seq_len, c1, 1, 1))
+        
+        # TCE Attention
+        self.num_heads = num_heads
+        
+        # 2. STIA
+        self.stia_gamma = nn.Parameter(torch.zeros(1))
+        self.out_conv = nn.Conv2d(c1, c2, 1)
+        
+        self.norm = nn.LayerNorm(c1)
+        
+        
+        self.loss_data = None
+        self.batch_data = None
+
+    # def forward(self, x, labels=None):
+    #     """
+    #     x: (BT, C, H, W)
+    #     """
+    #     BT, C, H, W = x.shape
+    #     T = self.seq_len
+        
+        
+    #     self.loss_data = None
+
+    #     # ============================================================
+    #     # ★★★ 修复 2: 鲁棒的训练/推理模式判定 ★★★
+    #     # ============================================================
+        
+    #     # 判定: 维度是否符合序列要求?
+    #     is_seq_shape = (BT > 0) and (BT % T == 0)
+    #     is_training = self.training
+
+    #     if is_seq_shape:
+    #         # ---> 训练模式: 拆分 Batch 和 Time
+    #         B = BT // T
+    #         # (B*T, C, H, W) -> (B, T, C, H, W) -> (B, C, T, H, W)
+    #         x_seq = x.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    #     else:
+    #         # ---> 推理模式 / Stride计算: 自动填充 (Auto-Padding)
+    #         # 将单张图复制 T 次，伪装成视频
+    #         B = BT
+    #         # (B, C, H, W) -> (B, 1, C, H, W) -> expand -> (B, C, T, H, W)
+    #         x_seq = x.unsqueeze(1).expand(-1, T, -1, -1, -1).permute(0, 2, 1, 3, 4).contiguous()
+    #     last_frame = x_seq[:, :, -1, :, :].contiguous()
+    #     # print(f"MTI: {last_frame.shape}")
+    #     return last_frame
+
+    def forward(self, x, labels=None):
+        """
+        x: (BT, C, H, W)
+        """
+        BT, C, H, W = x.shape
+        T = self.seq_len
+        
+        
+        self.loss_data = None
+
+        # ============================================================
+        # ★★★ 修复 2: 鲁棒的训练/推理模式判定 ★★★
+        # ============================================================
+        
+        # 判定: 维度是否符合序列要求?
+        is_seq_shape = (BT > 0) and (BT % T == 0)
+        is_training = self.training
+
+        if is_seq_shape:
+            # ---> 训练模式: 拆分 Batch 和 Time
+            B = BT // T
+            # (B*T, C, H, W) -> (B, T, C, H, W) -> (B, C, T, H, W)
+            x_seq = x.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        else:
+            # ---> 推理模式 / Stride计算: 自动填充 (Auto-Padding)
+            # 将单张图复制 T 次，伪装成视频
+            B = BT
+            # (B, C, H, W) -> (B, 1, C, H, W) -> expand -> (B, C, T, H, W)
+            x_seq = x.unsqueeze(1).expand(-1, T, -1, -1, -1).permute(0, 2, 1, 3, 4).contiguous()
+            
+            # 推理时强制清空标签
+            labels = None 
+            if hasattr(self, 'batch_data'):
+                delattr(self, 'batch_data')
+
+        # ============================================================
+
+        # 2. TCE 流程
+        x_pos = self.pos_perceiver(x_seq) + x_seq
+        
+        feat = x_pos.permute(0, 2, 1, 3, 4).contiguous() # (B, T, C, H, W)
+        
+        # 现在这里不会报错了
+        feat = feat + self.temporal_embed
+
+        # FlashAttention
+        qkv_input = feat.view(B, T, C, -1).permute(0, 3, 1, 2).reshape(B*H*W, T, C)
+        tce_out = F.scaled_dot_product_attention(qkv_input, qkv_input, qkv_input)
+        tce_out = tce_out + qkv_input
+        
+        # 恢复形状
+        F_temp = tce_out.view(B, H*W, T, C).permute(0, 2, 3, 1).view(B, T, C, H, W)
+        
+        # 3. STIA 流程
+        f_t_raw = F_temp[:, -1]
+        f_hist_raw = F_temp[:, :-1]
+
+        # ★★★ 核心修改: 进行 LayerNorm 归一化 ★★★
+        # 必须先归一化，否则 noise (std=1) 与特征尺度不匹配会导致梯度爆炸或噪声失效
+        # [B, C, H, W] -> [B, H, W, C] -> Norm -> [B, C, H, W]
+        f_t = self.norm(f_t_raw.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # Permute Back: [B, T-1, H, W, C] (0,1,2,3,4) -> [B, T-1, C, H, W] (0,1,4,2,3)
+        f_hist = self.norm(f_hist_raw.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
+
+        mask = None
+        f_repaired = f_t
+        
+        # 尝试获取注入的标签
+        if labels is None:
+            labels = getattr(self, 'batch_data', None)
+
+        if is_training and labels is not None and is_seq_shape:
+            mask = self.generate_mask(f_t, labels)
+            if mask is not None:
+                noise = torch.randn_like(f_t)
+                f_corrupted = f_t * (1 - mask) + noise * mask
+                
+                q_stia = f_corrupted.view(B, C, -1).permute(0, 2, 1).reshape(B*H*W, 1, C)
+                k_stia = f_hist.permute(0, 3, 4, 1, 2).reshape(B*H*W, T-1, C)
+                
+                stia_out = F.scaled_dot_product_attention(q_stia, k_stia, k_stia)
+                
+                f_repaired = q_stia + self.stia_gamma * stia_out
+                f_repaired = f_repaired.view(B, H*W, C).permute(0, 2, 1).view(B, C, H, W)
+                
+                self.loss_data = (f_repaired, f_t, mask)
+
+        if not (is_training and is_seq_shape and mask is not None):
+            self.loss_data = None
+
+        # print(BT, C, H, W, (self.loss_data is not None), is_training, is_seq_shape, (mask is not None))
+
+        out = self.out_conv(f_repaired)
+
+        return out
+
+    def generate_mask(self, x, batch_data):
+        """
+        真实的 Object-Centric Masking 实现
+        x: (B, C, H, W) 特征图
+        batch_data: 包含 'batch_idx' 和 'bboxes' 的字典
+        """
+        # 1. 基础校验
+        if batch_data is None:
+            return None
+        
+        # 80% 概率不遮挡 (Stochastic)
+        if torch.rand(1) > 0.5:
+            return None
+
+        B, C, H, W = x.shape
+        mask = torch.zeros((B, 1, H, W), device=x.device)
+        
+        # 2. 获取标签数据
+        # batch_idx: (N,) 表示每个框属于batch里的第几张图
+        # bboxes: (N, 4) 表示归一化的 [x_center, y_center, w, h]
+        try:
+            batch_idx = batch_data['batch_idx'].long()
+            bboxes = batch_data['bboxes']
+        except KeyError: 
+            return None # 如果字典里没有需要的key，安全退出
+
+        if bboxes.shape[0] == 0: return mask # 没有目标，返回全0
+
+        # 3. 将归一化坐标映射到特征图尺度 (Feature Map Coordinates)
+        # bboxes是 0~1 的，乘以 W, H 得到绝对坐标
+        # print(bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3])
+        x_c = bboxes[:, 0] * W
+        y_c = bboxes[:, 1] * H
+        w_box = bboxes[:, 2] * W
+        h_box = bboxes[:, 3] * H
+
+        # 转换为左上角(x1, y1) 和 右下角(x2, y2)
+        x1 = (x_c - w_box / 2).floor().long().clamp(0, W)
+        x2 = (x_c + w_box / 2).ceil().long().clamp(0, W)
+        y1 = (y_c - h_box / 2).floor().long().clamp(0, H)
+        y2 = (y_c + h_box / 2).ceil().long().clamp(0, H)
+        
+
+        # 4. 填充掩码
+        # 遍历每个框，将其在对应 batch 图片上的区域置为 1
+        # (这里用循环简单直观，因为 N 通常不大；追求极致性能可用 scatter)
+        num_boxes = batch_idx.shape[0]
+        for i in range(num_boxes):
+            b_id = batch_idx[i]
+            
+            # 安全检查：防止索引越界 (虽然理论上不会)
+            if b_id >= B: continue 
+            
+            # 将目标区域置 1
+            # 注意：如果多个框重叠，依然是 1，符合逻辑
+            if x2[i] > x1[i] and y2[i] > y1[i]:
+                mask[b_id, :, y1[i]:y2[i], x1[i]:x2[i]] = 1.0
+
+        return mask
+
+class TemporalSlice(nn.Module):
+    def __init__(self, seq_len=5):
+        super().__init__()
+        self.seq_len = seq_len
+
+    def forward(self, x):
+        # 1. 基础检查
+        BT = x.shape[0]
+        T = self.seq_len
+        
+        # 2. 推理/兼容模式判定
+        # 如果 batch 维度不够切，或者切不匀，通常意味着在做单图推理
+        if BT < T or BT % T != 0:
+            # 如果是训练模式，这通常意味着出Bug了，建议报错而不是通过
+            # if self.training:
+            #     raise ValueError(f"Training Error: Input batch {BT} is not divisible by seq_len {T}.")
+            return x
+
+        B = BT // T
+
+        # 3. 核心切片逻辑
+        # contiguous() 确保内存连续，防止 view 报错
+        # [:, -1] 取最后一帧
+        # 再次 contiguous() 确保输出给下一层的 Tensor 内存是整齐的
+        return x.contiguous().view(B, T, *x.shape[1:])[:, -1, ...].contiguous()
 
 class DFL(nn.Module):
     """

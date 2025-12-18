@@ -18,6 +18,8 @@ Example:
 """
 
 from .block import (
+    MTI_Block,
+    TemporalSlice,
     C1,
     C2,
     C2PSA,

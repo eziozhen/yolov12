@@ -1,1 +1,7 @@
 *__pycache__/
+
+runs*
+
+COCO2017*
+
+*.pt

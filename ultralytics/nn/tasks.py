@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.modules import (
+    MTI_Block,
+    TemporalSlice,
     AIFI,
     C1,
     C2,
@@ -957,6 +959,25 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # get module
+
+        # --- 添加这一行 ---
+        if m in (MTI_Block,): 
+            c1 = ch[f]
+            # args[0] 是 yaml 里的输出通道 (例如 1024)
+            # gw 是全局宽度缩放因子 (例如 n模型是 0.25)
+            # make_divisible 确保通道数是 8 的倍数（硬件友好）
+            c2 = make_divisible(args[0] * width, 8) # <--- ★★★ 就是这一行让它即插即用！★★★
+            
+            # 更新 args，把自动算好的 c2 传进去
+            args = [c1, c2, *args[1:]]
+        # ----------------
+
+        # --- 添加这一行 ---
+        elif m in (TemporalSlice,):
+            c1 = ch[f]
+            c2 = c1
+        # ----------------
+
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):

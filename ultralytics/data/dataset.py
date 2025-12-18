@@ -19,12 +19,15 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_18
 from .augment import (
     Compose,
     Format,
+    SequentialFormat,
     Instances,
     LetterBox,
+    SequentialLetterBox,
     RandomLoadText,
     classify_augmentations,
     classify_transforms,
     v8_transforms,
+    v8_video_transforms,
 )
 from .base import BaseDataset
 from .utils import (
@@ -247,6 +250,216 @@ class YOLODataset(BaseDataset):
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
 
+
+class YOLOVideoDataset(YOLODataset):
+    """
+    Dataset class for loading object detection and/or segmentation labels in YOLO format.
+
+    Args:
+        data (dict, optional): A dataset YAML dictionary. Defaults to None.
+        task (str): An explicit arg to point current task, Defaults to 'detect'.
+
+    Returns:
+        (torch.utils.data.Dataset): A PyTorch dataset object that can be used for training an object detection model.
+    """
+
+    def __init__(self, *args, n_history=0, stride_step=1, history_path=None, **kwargs):
+        """Initializes the YOLODataset with optional configurations for segments and keypoints."""
+        self.n_history = n_history
+        self.stride_step = stride_step
+        self.history_path = Path(history_path) if history_path else None
+        super().__init__(*args, **kwargs)
+
+    def load_image(self, i, rect_mode=True):
+        """
+        加载历史帧，返回一个 Python List of Numpy Arrays
+        List = [img_oldest, ..., img_current]
+        """
+        im_curr, (h0, w0), (h, w) = super().load_image(i, rect_mode=rect_mode)
+        
+
+        if self.n_history == 0:
+            return [im_curr], (h0, w0), (h, w)
+
+        f = self.im_files[i] # 获取当前文件路径 str
+        f_path = Path(f)
+        stem = f_path.stem
+        suffix = f_path.suffix
+        
+        if self.history_path is not None:
+            parent = self.history_path
+        else:
+            parent = f_path.parent
+
+        try:
+            prefix, frame_idx_str = stem.rsplit('_', 1)
+            curr_idx = int(frame_idx_str)
+        except ValueError:
+            # 解析失败，复制当前帧
+            return [im_curr.copy() for _ in range(self.n_history + 1)], (h0, w0), (h, w)
+
+        history_frames = []
+        target_size = (w, h)
+
+        for k in range(self.n_history, 0, -1):
+            target_idx = curr_idx - (k * self.stride_step)
+            
+            frame = None
+            if target_idx >= 0:
+                target_name = f"{prefix}_{target_idx:05d}{suffix}"
+                target_path = parent / target_name
+                
+                # 调用辅助函数加载单帧，逻辑严格对齐 BaseDataset
+                frame = self._load_single_history_frame(target_path, target_size)
+            
+            # Padding 策略：找不到文件或索引<0时，复制当前帧
+            if frame is None:
+                frame = im_curr.copy()
+            
+            history_frames.append(frame)
+
+        # 最终返回列表
+        all_frames = history_frames + [im_curr]
+        return all_frames, (h0, w0), (h, w)
+
+    def _load_single_history_frame(self, f_path, target_size):
+        """
+        辅助函数：严格复刻 BaseDataset 的加载和 Resize 逻辑。
+        Args:
+            f_path (Path): 图片路径
+            target_size (tuple): (w, h) 目标尺寸 (从当前帧获取)
+        """
+        im = None
+        f_str = str(f_path)
+
+        # --- A. 尝试加载 .npy (对齐 BaseDataset) ---
+        # 假设 .npy 和图片在同一目录，仅仅是后缀不同
+        npy_path = f_path.with_suffix('.npy')
+
+        if npy_path.exists():
+            try:
+                im = np.load(str(npy_path))
+            except Exception as e:
+                LOGGER.warning(f"WARNING ⚠️ Removing corrupt *.npy image file {npy_path} due to: {e}")
+                npy_path.unlink(missing_ok=True)
+
+        # --- B. 尝试加载 图片 (对齐 BaseDataset) ---
+        if im is None:
+            if f_path.exists():
+                im = cv2.imread(f_str) # BGR
+            else:
+                return None # 文件不存在
+
+        if im is None:
+            return None
+
+        # --- C. Resize (对齐 BaseDataset) ---
+        # BaseDataset 会根据 rect_mode 计算尺寸。
+        # 但在 load_image 中，我们已经通过 super() 拿到了当前帧计算好的 (h, w)。
+        # 为了保证 batch 内对齐，历史帧必须强制缩放到这个尺寸，而不是重新计算比例
+        # (因为如果历史帧原图尺寸因某种原因不仅同，重新计算会导致 shape 不匹配报错)
+
+        if im.shape[:2] != (target_size[1], target_size[0]): # opencv size is (w, h), shape is (h, w)
+             im = cv2.resize(im, target_size, interpolation=cv2.INTER_LINEAR)
+
+        return im
+
+    def build_transforms(self, hyp=None):
+        if self.augment:
+            # 强制关闭 Mosaic/Mixup，因为 Sequential 模式不支持
+            hyp.mosaic = 0.0
+            hyp.mixup = 0.0
+            hyp.copy_paste = 0.0
+            
+            # 调用我们自定义的 Video 工厂函数
+            transforms = v8_video_transforms(self, self.imgsz, hyp)
+        else:
+            # 验证集：只做 Resize
+            transforms = Compose([SequentialLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+
+        transforms.append(
+            SequentialFormat(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+            )
+        )
+        return transforms
+
+    def close_mosaic(self, hyp):
+        """Sets mosaic, copy_paste and mixup options to 0.0 and builds transformations."""
+        hyp.mosaic = 0.0  # set mosaic ratio=0.0
+        hyp.copy_paste = 0.0  # keep the same behavior as previous v8 close-mosaic
+        hyp.mixup = 0.0  # keep the same behavior as previous v8 close-mosaic
+        self.transforms = self.build_transforms(hyp)
+
+    def update_labels_info(self, label):
+        """
+        Custom your label format here.
+
+        Note:
+            cls is not with bboxes now, classification and semantic segmentation need an independent cls label
+            Can also support classification and semantic segmentation by adding or removing dict keys there.
+        """
+        bboxes = label.pop("bboxes")
+        segments = label.pop("segments", [])
+        keypoints = label.pop("keypoints", None)
+        bbox_format = label.pop("bbox_format")
+        normalized = label.pop("normalized")
+
+        # NOTE: do NOT resample oriented boxes
+        segment_resamples = 100 if self.use_obb else 1000
+        if len(segments) > 0:
+            # make sure segments interpolate correctly if original length is greater than segment_resamples
+            max_len = max(len(s) for s in segments)
+            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
+            # list[np.array(segment_resamples, 2)] * num_samples
+            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+        else:
+            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        return label
+
+    @staticmethod
+    def collate_fn(batch):
+        """Collates data samples into batches."""
+        new_batch = {}
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        
+        for i, k in enumerate(keys):
+            value = values[i]
+            
+            if k == "img":
+                # 1. 先堆叠: (Batch, Time, Channel, Height, Width)
+                value = torch.stack(value, 0)
+                
+                # 2. 【新增】在这里直接 Reshape (堆叠到 B)
+                # 变成: (Batch * Time, Channel, Height, Width)
+                b, t, c, h, w = value.shape
+                value = value.view(b * t, c, h, w)
+                
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+                # 标签保持原样，只对应 Batch 维度 (B)
+                value = torch.cat(value, 0)
+                
+            new_batch[k] = value
+
+        # 下面关于 batch_idx 的逻辑完全保持原样
+        # 生成的索引依然是 0, 1, 2... (对应 B，而不是 B*T)
+        # 这对于后续计算 Loss 是完全正确的，因为你的模型输出最终会变回 B
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        
+        return new_batch
 
 class YOLOMultiModalDataset(YOLODataset):
     """

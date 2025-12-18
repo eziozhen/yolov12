@@ -159,6 +159,8 @@ class v8DetectionLoss:
 
     def __init__(self, model, tal_topk=10):  # model must be de-paralleled
         """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
+        self.model = model
+        
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
 
@@ -205,7 +207,7 @@ class v8DetectionLoss:
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, mti_loss
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -257,6 +259,39 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
+        # ====================================================
+        # ★★★ MTI-Net 辅助 Loss 计算 (插入在 return 之前) ★★★
+        # ====================================================
+        
+        mti_loss = torch.tensor(0.0, device=self.device)
+        
+        # 遍历模型的所有模块，寻找 MTI_Block
+        if hasattr(self.model, 'modules'):
+            for m in self.model.modules():
+                # 检查该模块是否有 loss_data 属性，且不为空
+                if hasattr(m, 'loss_data') and m.loss_data is not None:
+                    # print("Enter loss_data")
+                    f_repaired, f_orig, mask = m.loss_data
+
+                    if mask.sum() > 0:
+                        # 计算 MSE Loss (只计算 Mask 区域)
+                        # 公式: || (Repaired - StopGrad[Orig]) * Mask ||^2
+
+                        # print("Enter mask")
+
+                        target = f_orig.detach() # Stop Gradient
+                        diff = (f_repaired - target) * mask
+                        
+                        # 归一化 MSE
+                        current_loss = (diff ** 2).sum() / (mask.sum() + 1e-6)
+                        mti_loss += current_loss
+
+                    # ★★★ 算完后清空，防止显存泄漏或推理干扰 ★★★
+                    m.loss_data = None
+
+        # 给 MTI Loss 一个权重 (例如 1.0)
+        loss[3] = mti_loss * 0.005 # 我们可以把它加在 box loss 上，或者加在 total 上
+        # ====================================================
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
