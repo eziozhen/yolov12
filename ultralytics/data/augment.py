@@ -314,6 +314,170 @@ class Compose:
         """
         return f"{self.__class__.__name__}({', '.join([f'{t}' for t in self.transforms])})"
 
+class SequentialBaseMixTransform:
+    """
+    Base class for sequential mix transformations (e.g., Video Mosaic, Video MixUp).
+    
+    Designed for inputs where 'img' contains T frames (List or Tensor), but 'instances'/'cls' 
+    labels correspond ONLY to the last frame (frame T-1).
+
+    It ensures temporal consistency: the same random spatial augmentations (flip, perspective, etc.)
+    are applied to all T frames in a sequence.
+    """
+
+    def __init__(self, dataset, pre_transform=None, p=0.0) -> None:
+        """
+        Args:
+            dataset (Any): Dataset returning dict with 'img' as (T, H, W, C) or List[np.ndarray].
+            pre_transform (Callable | None): Transform to apply BEFORE mixing (e.g. RandomFlip).
+                                             Must accept standard dict input.
+            p (float): Probability.
+        """
+        self.dataset = dataset
+        self.pre_transform = pre_transform
+        self.p = p
+
+    def __call__(self, labels):
+        """
+        Applies pre-transforms and mix transforms to a sequence of images.
+        """
+        if random.uniform(0, 1) > self.p:
+            return labels
+
+        # 1. Get indexes of other sequences to mix
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
+
+        # 2. Load mix candidates (Each candidate 'img' should be a sequence of T frames)
+        # Note: We deepcopy to avoid modifying the buffer/cache in place during pre-transform
+        mix_labels = [deepcopy(self.dataset.get_image_and_label(i)) for i in indexes]
+
+        # 3. Apply pre_transform to Main Sequence + Mix Sequences
+        # ensuring temporal consistency across frames for each sequence.
+        if self.pre_transform is not None:
+            # Apply to main labels
+            labels = self._apply_sequence_pre_transform(labels)
+            # Apply to mix labels
+            for i, data in enumerate(mix_labels):
+                mix_labels[i] = self._apply_sequence_pre_transform(data)
+
+        labels["mix_labels"] = mix_labels
+
+        # 4. Update cls and texts (Only affects the last frame's labels)
+        labels = self._update_label_text(labels)
+
+        # 5. Execute the specific Mix logic (Mosaic/MixUp)
+        # Subclasses must handle the 'img' list/tensor iteration internally
+        labels = self._mix_transform(labels)
+        
+        labels.pop("mix_labels", None)
+        return labels
+
+    def _apply_sequence_pre_transform(self, labels):
+        """
+        Applies self.pre_transform to a sequence of images with Temporal Consistency.
+        
+        Mechanism:
+        It captures the random state before processing the first frame, and restores 
+        that exact state before processing every subsequent frame. This forces 
+        randomized transforms (like RandomFlip or RandomPerspective) to generate 
+        the exact same parameters for all frames.
+        """
+        # Check if img is a sequence (List or 4D Tensor)
+        imgs = labels["img"]
+        is_sequence = isinstance(imgs, list) or (isinstance(imgs, np.ndarray) and imgs.ndim == 4)
+        
+        if not is_sequence:
+            # Fallback for single image
+            return self.pre_transform(labels)
+
+        T = len(imgs)
+        # Separate the labels (which belong to the last frame)
+        # For frames 0 to T-2, we will use a dummy label to satisfy the transform API
+        last_frame_labels = {k: v for k, v in labels.items() if k != "img"}
+        
+        transformed_imgs = []
+        
+        # Capture current random states
+        rng_state_py = random.getstate()
+        rng_state_np = np.random.get_state()
+        rng_state_torch = torch.get_rng_state()
+
+        # --- Loop through frames ---
+        for t in range(T):
+            # 1. Restore random state to ensure SAME transform params as t=0
+            random.setstate(rng_state_py)
+            np.random.set_state(rng_state_np)
+            torch.set_rng_state(rng_state_torch)
+
+            # 2. Construct temporary data dict for this frame
+            frame_img = imgs[t]
+            
+            if t == T - 1:
+                # LAST FRAME: Use real labels
+                frame_data = {"img": frame_img, **last_frame_labels}
+                
+                # Apply transform
+                frame_data = self.pre_transform(frame_data)
+                
+                # Save transformed image and update the labels
+                transformed_imgs.append(frame_data["img"])
+                # Update original labels with the transformed labels (bbox, cls)
+                for k, v in frame_data.items():
+                    if k != "img":
+                        labels[k] = v
+            else:
+                # PREVIOUS FRAMES: Use dummy/empty labels
+                # We only care about the pixel transformation here.
+                # Note: We must pass a structure compatible with pre_transform.
+                # Assuming pre_transform can handle empty bboxes/cls or we pass copies.
+                frame_data = {"img": frame_img, **copy.deepcopy(last_frame_labels)}
+                
+                # Apply transform
+                frame_data = self.pre_transform(frame_data)
+                
+                # Only save the image
+                transformed_imgs.append(frame_data["img"])
+
+        # Update the sequence in the labels dict
+        labels["img"] = transformed_imgs 
+        # (Optional: Re-stack to numpy if input was numpy)
+        if isinstance(imgs, np.ndarray):
+             labels["img"] = np.stack(transformed_imgs)
+
+        return labels
+
+    # def _mix_transform(self, labels):
+    #     """
+    #     Abstract method. Subclasses (SequentialMosaic, SequentialMixUp) 
+    #     must implement the logic to mix the sequences.
+    #     """
+    #     raise NotImplementedError
+
+    # def get_indexes(self):
+    #     """Standard get_indexes implementation"""
+    #     raise NotImplementedError
+
+    @staticmethod
+    def _update_label_text(labels):
+        """
+        Updates label text. Since labels only exist for the last frame, 
+        this logic is identical to the single-image version.
+        """
+        if "texts" not in labels:
+            return labels
+
+        mix_texts = sum([labels["texts"]] + [x["texts"] for x in labels["mix_labels"]], [])
+        mix_texts = list({tuple(x) for x in mix_texts})
+        text2id = {text: i for i, text in enumerate(mix_texts)}
+
+        for label in [labels] + labels["mix_labels"]:
+            for i, cls in enumerate(label["cls"].squeeze(-1).tolist()):
+                text = label["texts"][int(cls)]
+                label["cls"][i] = text2id[tuple(text)]
+            label["texts"] = mix_texts
+        return labels
 
 class BaseMixTransform:
     """
@@ -863,6 +1027,409 @@ class Mosaic(BaseMixTransform):
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
 
+class SequentialMosaic:
+    """
+    Sequential Mosaic augmentation for video datasets.
+    
+    This class is standalone and does not inherit from BaseMixTransform or Mosaic.
+    It combines logic for temporal consistency and mosaic augmentation into one place.
+
+    Attributes:
+        dataset: The dataset object. 'img' is expected to be (T, H, W, C) or List[np.ndarray].
+                 'instances' corresponds to the LAST frame.
+        imgsz (int): Target image size.
+        p (float): Probability.
+        n (int): Grid size (4 or 9).
+        pre_transform (Callable): Optional transform applied BEFORE mosaic (with temporal lock).
+    """
+
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, pre_transform=None):
+        """
+        Args:
+            dataset (Any): Dataset object.
+            imgsz (int): Image size.
+            p (float): Probability [0, 1].
+            n (int): Grid size (4 or 9).
+            pre_transform (Callable): Pre-processing transform (e.g., RandomFlip).
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        assert n in {4, 9}, "grid must be equal to 4 or 9."
+        
+        self.dataset = dataset
+        self.imgsz = imgsz
+        self.border = (-imgsz // 2, -imgsz // 2)  # width, height
+        self.n = n
+        self.p = p
+        self.pre_transform = pre_transform
+
+    def __call__(self, labels):
+        """
+        Main entry point. Applies pre-transform (sequentially) and Mosaic.
+        """
+        if random.uniform(0, 1) > self.p:
+            return labels
+
+        # 1. Get indexes
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
+
+        # 2. Load mix candidates (Deepcopy to protect cache)
+        # Each 'img' here is a sequence (List or Array)
+        mix_labels = [deepcopy(self.dataset.get_image_and_label(i)) for i in indexes]
+
+        # 3. Apply pre_transform with Temporal Consistency
+        if self.pre_transform is not None:
+            # Apply to main sequence
+            labels = self._apply_sequence_pre_transform(labels)
+            # Apply to mix sequences
+            for i, data in enumerate(mix_labels):
+                mix_labels[i] = self._apply_sequence_pre_transform(data)
+
+        labels["mix_labels"] = mix_labels
+
+        # 4. Update texts/cls mapping
+        labels = self._update_label_text(labels)
+
+        # Mosaic or MixUp
+        labels = self._mix_transform(labels)
+        labels.pop("mix_labels", None)
+        return labels
+
+    def _mix_transform(self, labels):
+        """
+        Applies mosaic augmentation to the input image and labels.
+
+        This method combines multiple images (3, 4, or 9) into a single mosaic image based on the 'n' attribute.
+        It ensures that rectangular annotations are not present and that there are other images available for
+        mosaic augmentation.
+
+        Args:
+            labels (Dict): A dictionary containing image data and annotations. Expected keys include:
+                - 'rect_shape': Should be None as rect and mosaic are mutually exclusive.
+                - 'mix_labels': A list of dictionaries containing data for other images to be used in the mosaic.
+
+        Returns:
+            (Dict): A dictionary containing the mosaic-augmented image and updated annotations.
+
+        Raises:
+            AssertionError: If 'rect_shape' is not None or if 'mix_labels' is empty.
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640, p=1.0, n=4)
+            >>> augmented_data = mosaic._mix_transform(labels)
+        """
+        assert labels.get("rect_shape", None) is None, "rect and mosaic are mutually exclusive."
+        assert len(labels.get("mix_labels", [])), "There are no other images for mosaic augment."
+        return (
+            self._mosaic3(labels) if self.n == 3 else self._mosaic4(labels) if self.n == 4 else self._mosaic9(labels)
+        )  # This code is modified for mosaic3 method.
+
+    def _apply_sequence_pre_transform(self, labels):
+        """
+        Applies self.pre_transform to a sequence while locking random seeds 
+        to ensure all frames get the exact same augmentation.
+        """
+        imgs = labels["img"]
+        # Determine if input is a sequence
+        is_list = isinstance(imgs, list)
+        is_array_seq = isinstance(imgs, np.ndarray) and imgs.ndim == 4
+        
+        if not (is_list or is_array_seq):
+            # Not a sequence, just apply normally
+            return self.pre_transform(labels)
+
+        T = len(imgs)
+        # Separate labels (belonging to last frame)
+        last_frame_labels = {k: v for k, v in labels.items() if k != "img"}
+        transformed_imgs = []
+
+        # Capture random states
+        rng_state_py = random.getstate()
+        rng_state_np = np.random.get_state()
+        rng_state_torch = torch.get_rng_state()
+
+        for t in range(T):
+            # Restore seeds for every frame
+            random.setstate(rng_state_py)
+            np.random.set_state(rng_state_np)
+            torch.set_rng_state(rng_state_torch)
+
+            frame_img = imgs[t]
+            
+            if t == T - 1:
+                # Last frame: use real labels
+                frame_data = {"img": frame_img, **last_frame_labels}
+                frame_data = self.pre_transform(frame_data)
+                
+                transformed_imgs.append(frame_data["img"])
+                # Update labels in the main dict
+                for k, v in frame_data.items():
+                    if k != "img":
+                        labels[k] = v
+            else:
+                # Past frames: use dummy labels (deepcopy to be safe)
+                frame_data = {"img": frame_img, **copy.deepcopy(last_frame_labels)}
+                frame_data = self.pre_transform(frame_data)
+                transformed_imgs.append(frame_data["img"])
+
+        # Update image sequence
+        if is_list:
+            labels["img"] = transformed_imgs
+        else:
+            labels["img"] = np.stack(transformed_imgs)
+            
+        return labels
+
+    def get_indexes(self, buffer=True):
+        """Returns a list of random indexes from the dataset."""
+        if buffer:  # select images from buffer
+            return random.choices(list(self.dataset.buffer), k=self.n - 1)
+        else:  # select any images
+            return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
+
+    def _mosaic4(self, labels):
+        """Creates a 2x2 sequential image mosaic."""
+        mosaic_labels = []
+        s = self.imgsz
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
+        
+        # Check sequence info
+        imgs_source = labels["img"]
+        is_list = isinstance(imgs_source, list)
+        T = len(imgs_source) if is_list else imgs_source.shape[0]
+
+        for i in range(4):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            
+            # Load sequence
+            imgs = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img in img4
+            if i == 0:  # top left
+                # --- Initialize Canvas (Sequence) ---
+                if is_list:
+                    img4 = [np.full((s * 2, s * 2, imgs[0].shape[2]), 114, dtype=np.uint8) for _ in range(T)]
+                else:
+                    img4 = np.full((T, s * 2, s * 2, imgs.shape[3]), 114, dtype=np.uint8)
+                # ------------------------------------
+
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            # --- Paste pixels for all frames (Temporal Consistency) ---
+            for t in range(T):
+                img_t = imgs[t]
+                if is_list:
+                    img4[t][y1a:y2a, x1a:x2a] = img_t[y1b:y2b, x1b:x2b]
+                else:
+                    img4[t, y1a:y2a, x1a:x2a] = img_t[y1b:y2b, x1b:x2b]
+            # --------------------------------------------------------
+
+            padw = x1a - x1b
+            padh = y1a - y1b
+
+            # Labels handling (Unchanged, applies to last frame)
+            labels_patch = self._update_labels(labels_patch, padw, padh)
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        final_labels["img"] = img4
+        return final_labels
+
+    def _mosaic9(self, labels):
+        """Creates a 3x3 sequential image mosaic."""
+        mosaic_labels = []
+        s = self.imgsz
+        hp, wp = -1, -1  # height, width previous
+        
+        # Check sequence info
+        imgs_source = labels["img"]
+        is_list = isinstance(imgs_source, list)
+        T = len(imgs_source) if is_list else imgs_source.shape[0]
+
+        for i in range(9):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            
+            # Load sequence
+            imgs = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img in img9
+            if i == 0:  # center
+                # --- Initialize Canvas (Sequence) ---
+                if is_list:
+                    img9 = [np.full((s * 3, s * 3, imgs[0].shape[2]), 114, dtype=np.uint8) for _ in range(T)]
+                else:
+                    img9 = np.full((T, s * 3, s * 3, imgs.shape[3]), 114, dtype=np.uint8)
+                # ------------------------------------
+                
+                h0, w0 = h, w
+                c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
+            elif i == 1:  # top
+                c = s, s - h, s + w, s
+            elif i == 2:  # top right
+                c = s + wp, s - h, s + wp + w, s
+            elif i == 3:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 4:  # bottom right
+                c = s + w0, s + hp, s + w0 + w, s + hp + h
+            elif i == 5:  # bottom
+                c = s + w0 - w, s + h0, s + w0, s + h0 + h
+            elif i == 6:  # bottom left
+                c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+            elif i == 7:  # left
+                c = s - w, s + h0 - h, s, s + h0
+            elif i == 8:  # top left
+                c = s - w, s + h0 - hp - h, s, s + h0 - hp
+
+            padw, padh = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coordinates
+
+            # --- Paste pixels for all frames (Temporal Consistency) ---
+            for t in range(T):
+                img_t = imgs[t]
+                # img9[ymin:ymax, xmin:xmax]
+                if is_list:
+                    img9[t][y1:y2, x1:x2] = img_t[y1 - padh :, x1 - padw :]
+                else:
+                    img9[t, y1:y2, x1:x2] = img_t[y1 - padh :, x1 - padw :]
+            # --------------------------------------------------------
+
+            hp, wp = h, w  # height, width previous for next iteration
+
+            # Labels handling (Unchanged)
+            labels_patch = self._update_labels(labels_patch, padw + self.border[0], padh + self.border[1])
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        
+        # Crop final sequence
+        if is_list:
+            final_labels["img"] = [
+                frame[-self.border[0] : self.border[0], -self.border[1] : self.border[1]] 
+                for frame in img9
+            ]
+        else:
+            final_labels["img"] = img9[:, -self.border[0] : self.border[0], -self.border[1] : self.border[1], :]
+            
+        return final_labels
+
+    def _mosaic3(self, labels):
+        """Creates a 1x3 sequential image mosaic."""
+        mosaic_labels = []
+        s = self.imgsz
+        
+        imgs_source = labels["img"]
+        is_list = isinstance(imgs_source, list)
+        T = len(imgs_source) if is_list else imgs_source.shape[0]
+
+        for i in range(3):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            imgs = labels_patch["img"]
+            h, w = labels_patch.pop("resized_shape")
+
+            if i == 0:  # center
+                if is_list:
+                    img3 = [np.full((s * 3, s * 3, imgs[0].shape[2]), 114, dtype=np.uint8) for _ in range(T)]
+                else:
+                    img3 = np.full((T, s * 3, s * 3, imgs.shape[3]), 114, dtype=np.uint8)
+                    
+                h0, w0 = h, w
+                c = s, s, s + w, s + h
+            elif i == 1:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 2:  # left
+                c = s - w, s + h0 - h, s, s + h0
+
+            padw, padh = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)
+
+            # --- Loop T ---
+            for t in range(T):
+                img_t = imgs[t]
+                if is_list:
+                    img3[t][y1:y2, x1:x2] = img_t[y1 - padh :, x1 - padw :]
+                else:
+                    img3[t, y1:y2, x1:x2] = img_t[y1 - padh :, x1 - padw :]
+            # --------------
+
+            labels_patch = self._update_labels(labels_patch, padw + self.border[0], padh + self.border[1])
+            mosaic_labels.append(labels_patch)
+            
+        final_labels = self._cat_labels(mosaic_labels)
+        
+        if is_list:
+            final_labels["img"] = [
+                frame[-self.border[0] : self.border[0], -self.border[1] : self.border[1]] 
+                for frame in img3
+            ]
+        else:
+            final_labels["img"] = img3[:, -self.border[0] : self.border[0], -self.border[1] : self.border[1], :]
+            
+        return final_labels
+
+    @staticmethod
+    def _update_labels(labels, padw, padh):
+        """Updates label coordinates with padding values."""
+        nh, nw = labels["img"][0].shape[:2] # Note: use first frame shape
+        labels["instances"].convert_bbox(format="xyxy")
+        labels["instances"].denormalize(nw, nh)
+        labels["instances"].add_padding(padw, padh)
+        return labels
+
+    def _cat_labels(self, mosaic_labels):
+        """Concatenates and processes labels for mosaic augmentation."""
+        if len(mosaic_labels) == 0:
+            return {}
+        cls = []
+        instances = []
+        imgsz = self.imgsz * 2  # mosaic imgsz
+        for labels in mosaic_labels:
+            cls.append(labels["cls"])
+            instances.append(labels["instances"])
+        
+        final_labels = {
+            "im_file": mosaic_labels[0]["im_file"],
+            "ori_shape": mosaic_labels[0]["ori_shape"],
+            "resized_shape": (imgsz, imgsz),
+            "cls": np.concatenate(cls, 0),
+            "instances": Instances.concatenate(instances, axis=0),
+            "mosaic_border": self.border,
+        }
+        final_labels["instances"].clip(imgsz, imgsz)
+        good = final_labels["instances"].remove_zero_area_boxes()
+        final_labels["cls"] = final_labels["cls"][good]
+        if "texts" in mosaic_labels[0]:
+            final_labels["texts"] = mosaic_labels[0]["texts"]
+        return final_labels
+    
+    @staticmethod
+    def _update_label_text(labels):
+        """Updates label text and class IDs for mixed labels."""
+        if "texts" not in labels:
+            return labels
+
+        mix_texts = sum([labels["texts"]] + [x["texts"] for x in labels["mix_labels"]], [])
+        mix_texts = list({tuple(x) for x in mix_texts})
+        text2id = {text: i for i, text in enumerate(mix_texts)}
+
+        for label in [labels] + labels["mix_labels"]:
+            for i, cls in enumerate(label["cls"].squeeze(-1).tolist()):
+                text = label["texts"][int(cls)]
+                label["cls"][i] = text2id[tuple(text)]
+            label["texts"] = mix_texts
+        return labels
 
 class MixUp(BaseMixTransform):
     """
@@ -948,6 +1515,160 @@ class MixUp(BaseMixTransform):
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
         return labels
 
+class SequentialMixUp:
+    """
+    Sequential MixUp augmentation for video datasets.
+    
+    This class implements MixUp for sequences (T, H, W, C).
+    Key feature: It applies the SAME mixing ratio 'r' across all frames 
+    to maintain temporal consistency (no flickering).
+
+    Attributes:
+        dataset: Dataset returning dict with 'img' as (T, H, W, C) or List[np.ndarray].
+        pre_transform: Transform to apply BEFORE mixing (with temporal seed lock).
+        p (float): Probability.
+    """
+
+    def __init__(self, dataset, pre_transform=None, p=0.0) -> None:
+        """
+        Args:
+            dataset (Any): The dataset object.
+            pre_transform (Callable | None): Transform to apply before MixUp.
+            p (float): Probability [0, 1].
+        """
+        self.dataset = dataset
+        self.pre_transform = pre_transform
+        self.p = p
+
+    def __call__(self, labels):
+        """Main entry point."""
+        if random.uniform(0, 1) > self.p:
+            return labels
+
+        # 1. Get indexes
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
+
+        # 2. Load mix candidates (Deepcopy)
+        mix_labels = [copy.deepcopy(self.dataset.get_image_and_label(i)) for i in indexes]
+
+        # 3. Apply pre_transform with Temporal Consistency
+        if self.pre_transform is not None:
+            labels = self._apply_sequence_pre_transform(labels)
+            for i, data in enumerate(mix_labels):
+                mix_labels[i] = self._apply_sequence_pre_transform(data)
+
+        labels["mix_labels"] = mix_labels
+
+        # 4. Update texts/cls mapping
+        labels = self._update_label_text(labels)
+
+        # 5. Apply MixUp Logic
+        labels = self._mix_transform(labels)
+        
+        labels.pop("mix_labels", None)
+        return labels
+
+    def _mix_transform(self, labels):
+        """
+        Applies MixUp to the sequence.
+        """
+        # 1. Generate ONE random ratio 'r' for the whole sequence
+        r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
+        
+        # Data preparation
+        labels2 = labels["mix_labels"][0]
+        imgs1 = labels["img"]
+        imgs2 = labels2["img"]
+        
+        is_list = isinstance(imgs1, list)
+        
+        # 2. Mix Images (Frame by Frame or Vectorized)
+        if is_list:
+            # Case: List[np.ndarray]
+            # Ensure lengths match (usually guaranteed by dataset)
+            T = min(len(imgs1), len(imgs2))
+            new_imgs = []
+            for t in range(T):
+                # im1 * r + im2 * (1 - r)
+                # Note: Input images are usually uint8, we cast during math then cast back
+                im_mix = (imgs1[t] * r + imgs2[t] * (1 - r)).astype(np.uint8)
+                new_imgs.append(im_mix)
+            labels["img"] = new_imgs
+        else:
+            # Case: np.ndarray (T, H, W, C)
+            # Numpy broadcasting handles T dimension automatically
+            labels["img"] = (imgs1 * r + imgs2 * (1 - r)).astype(np.uint8)
+
+        # 3. Mix Labels (Concatenate - affects last frame representation)
+        labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
+        labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        
+        return labels
+
+    def _apply_sequence_pre_transform(self, labels):
+        """
+        Applies self.pre_transform to a sequence while locking random seeds.
+        """
+        imgs = labels["img"]
+        is_list = isinstance(imgs, list)
+        is_array_seq = isinstance(imgs, np.ndarray) and imgs.ndim == 4
+        
+        if not (is_list or is_array_seq):
+            return self.pre_transform(labels)
+
+        T = len(imgs)
+        last_frame_labels = {k: v for k, v in labels.items() if k != "img"}
+        transformed_imgs = []
+
+        rng_state_py = random.getstate()
+        rng_state_np = np.random.get_state()
+        rng_state_torch = torch.get_rng_state()
+
+        for t in range(T):
+            random.setstate(rng_state_py)
+            np.random.set_state(rng_state_np)
+            torch.set_rng_state(rng_state_torch)
+
+            frame_img = imgs[t]
+            if t == T - 1:
+                frame_data = {"img": frame_img, **last_frame_labels}
+                frame_data = self.pre_transform(frame_data)
+                transformed_imgs.append(frame_data["img"])
+                for k, v in frame_data.items():
+                    if k != "img": labels[k] = v
+            else:
+                frame_data = {"img": frame_img, **copy.deepcopy(last_frame_labels)}
+                frame_data = self.pre_transform(frame_data)
+                transformed_imgs.append(frame_data["img"])
+
+        if is_list:
+            labels["img"] = transformed_imgs
+        else:
+            labels["img"] = np.stack(transformed_imgs)
+        return labels
+
+    def get_indexes(self):
+        """Get a random index."""
+        return random.randint(0, len(self.dataset) - 1)
+
+    @staticmethod
+    def _update_label_text(labels):
+        """Updates label text and class IDs for mixed labels."""
+        if "texts" not in labels:
+            return labels
+
+        mix_texts = sum([labels["texts"]] + [x["texts"] for x in labels["mix_labels"]], [])
+        mix_texts = list({tuple(x) for x in mix_texts})
+        text2id = {text: i for i, text in enumerate(mix_texts)}
+
+        for label in [labels] + labels["mix_labels"]:
+            for i, cls in enumerate(label["cls"].squeeze(-1).tolist()):
+                text = label["texts"][int(cls)]
+                label["cls"][i] = text2id[tuple(text)]
+            label["texts"] = mix_texts
+        return labels
 
 class RandomPerspective:
     """
@@ -2885,7 +3606,7 @@ def v8_video_transforms(dataset, imgsz, hyp, stretch=False):
     针对 Video List 数据结构的增强工厂函数。
     结构模仿 v8_transforms，但移除了马赛克/Mixup，并替换为 Sequential 类。
     """
-
+    
     # 1. 基础几何变换 (LetterBox -> Affine)
     # 注意：在 v8_transforms 里，LetterBox 被作为 pre_transform 塞进了 RandomPerspective
     pre_transform = SequentialLetterBox(new_shape=(imgsz, imgsz)) if not stretch else None
@@ -2903,9 +3624,13 @@ def v8_video_transforms(dataset, imgsz, hyp, stretch=False):
     # 我们移除了 Mosaic/MixUp，因为它们会破坏由 List 维护的时序关系
     # 如果你必须要有 Mosaic，需要写一个极其复杂的 SequentialMosaic
     
-    t_list = [affine] # 基础几何
+    mosaic = SequentialMosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    
+    t_list = [mosaic, affine] # 基础几何
 
     t_list.append(SequentialAlbumentations(p=1.0))
+    
+    t_list.append(SequentialMixUp(dataset, pre_transform=pre_transform, p=hyp.mixup))
     
     # 3. 颜色增强
     t_list.append(SequentialRandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v))

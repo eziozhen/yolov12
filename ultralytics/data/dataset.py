@@ -366,11 +366,9 @@ class YOLOVideoDataset(YOLODataset):
 
     def build_transforms(self, hyp=None):
         if self.augment:
-            # 强制关闭 Mosaic/Mixup，因为 Sequential 模式不支持
-            hyp.mosaic = 0.0
-            hyp.mixup = 0.0
-            hyp.copy_paste = 0.0
-            
+            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+
             # 调用我们自定义的 Video 工厂函数
             transforms = v8_video_transforms(self, self.imgsz, hyp)
         else:
