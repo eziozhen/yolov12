@@ -95,13 +95,14 @@ from multiprocessing import Process, Manager
 # -----------------------------------------------------------
 # 引入 ByteTrack
 # -----------------------------------------------------------
-try:
-    from byte_tracker.tracker.byte_tracker import BYTETracker
-except ImportError:
-    print("【警告】未找到 ByteTrack 模块！正在使用占位类。")
-    class BYTETracker:
-        def __init__(self, args, frame_rate=30): pass
-        def update(self, output_results, img_info, img_size): return []
+from byte_tracker.tracker.byte_tracker import BYTETracker
+# try:
+#     from byte_tracker.tracker.byte_tracker import BYTETracker
+# except ImportError:
+#     print("【警告】未找到 ByteTrack 模块！正在使用占位类。")
+#     class BYTETracker:
+#         def __init__(self, args, frame_rate=30): pass
+#         def update(self, output_results, img_info, img_size): return []
 
 # -----------------------------------------------------------
 # 全局配置参数
@@ -109,7 +110,7 @@ except ImportError:
 class Config:
     # [关键路径配置]
     IMG_DIR = "../ALL_JPEG"                # 图片文件夹
-    GT_DIR = "./VOCdevkit/VOC2007/Annotations/predict"              # 【优先级1】人工真值文件夹 (绝对锚点)
+    GT_DIR = "./VOCdevkit/VOC2007/Annotations"              # 【优先级1】人工真值文件夹 (绝对锚点)
     YOLO_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main-modify/predict_low_conf/xml"         # 【优先级2】YOLO检测文件夹 (自动检测)
 
     OUT_DIR = "predict_final_dart"  # 最终输出结果
@@ -117,12 +118,13 @@ class Config:
 
     # ================= [新增缓存配置] =================
     USE_CACHE = True                # 是否启用缓存
-    CACHE_DIR = "dart_cache"        # 缓存文件存放目录
+    CACHE_DIR = "dart_cache_new"        # 缓存文件存放目录
     FORCE_REBUILD = False           # 设为 True 可强制重新运行 CSRT (忽略已有缓存)
 
     # [DART 完美帧筛选]
     SAVE_PERFECT_FRAMES = True
     BEST_FRAMES_DIR = "dart_perfect_samples"
+    BEST_FRAMES_XML_DIR = "dart_perfect_samples_xml"
     PERFECT_FRAME_DIV = 0.1        # 代表正向跟踪和反向跟踪结果之间的“散度”（Divergence）。0.05 意味着正反向轨迹的 IoU（交并比）必须高于 0.95。
 
     # [核心] 算法阈值
@@ -493,7 +495,7 @@ class SOTGenerator:
         MAX_TTL = 60        # 高召回：允许盲跑 2 秒
         
         # [内置策略阈值]
-        RESET_SCORE_THRES = 0.7  # YOLO分 > 0.7 时强制重置 (防止飘移)
+        RESET_SCORE_THRES = 0.6  # YOLO分 > 0.7 时强制重置 (防止飘移)
         BORDER_MARGIN = 15       # 边缘禁区 (防止边缘堆积)
         SCORE_DECAY = 0.95       # 盲跑衰减 (解决大框套小框，让旧框变弱)
         MATCH_THRES = 0.3        # 宽松匹配
@@ -667,9 +669,8 @@ class DARTPipeline:
             os.makedirs(Config.VIS_DIR)
         if Config.SAVE_PERFECT_FRAMES and not os.path.exists(Config.BEST_FRAMES_DIR):
             os.makedirs(Config.BEST_FRAMES_DIR)
-        perfect_xml_dir = Config.BEST_FRAMES_DIR + "_xml"
-        if Config.SAVE_PERFECT_FRAMES and not os.path.exists(perfect_xml_dir):
-            os.makedirs(perfect_xml_dir)
+        if Config.SAVE_PERFECT_FRAMES and not os.path.exists(Config.BEST_FRAMES_XML_DIR):
+            os.makedirs(Config.BEST_FRAMES_XML_DIR)
 
     def run_sot_process(self, frame_list, direction, return_dict):
         gen = SOTGenerator()
@@ -870,6 +871,66 @@ class DARTPipeline:
         
         return matched_count / N
 
+    def is_x_axis_continuous(self, final_objs, img_width):
+        """
+        通过 X 轴投影覆盖率判定该帧是否异常
+        """
+        if len(final_objs) < 10: return False
+
+        # 1. 获取所有框在 X 轴上的线段 [xmin, xmax]
+        intervals = []
+        for obj in final_objs:
+            intervals.append([obj['box'][0], obj['box'][2]])
+        
+        # 按左端点排序
+        intervals.sort(key=lambda x: x[0])
+
+        # 2. 合并重叠线段 (Merge Intervals)
+        merged = []
+        if not intervals: return False
+        
+        curr = intervals[0]
+        for i in range(1, len(intervals)):
+            if intervals[i][0] <= curr[1]: # 有重叠
+                curr[1] = max(curr[1], intervals[i][1])
+            else: # 断开了
+                merged.append(curr)
+                curr = intervals[i]
+        merged.append(curr)
+
+        # 3. 分析合并后的区间
+        # 按区间长度排序，找最长的（主列）
+        merged.sort(key=lambda x: x[1] - x[0], reverse=True)
+        main_interval = merged[0]
+        main_len = main_interval[1] - main_interval[0]
+
+        # 阈值设置：基于图像宽度或物体平均宽度
+        # 假设麦穗平均宽度约 100-150px (4K图)
+        MAX_GAP_ALLOWED = img_width * 0.05 # 允许最大 5% 宽度的断裂
+        MIN_MAIN_COL_WIDTH = img_width * 0.15 # 主列至少要占 15% 宽度
+
+        # 判定 A: 主列是否太窄
+        if main_len < MIN_MAIN_COL_WIDTH:
+            return False
+
+        # 判定 B: 是否存在严重的侧边干扰 (Gap 检查)
+        # 如果有多个区间，检查主区间与其他区间之间的空隙
+        if len(merged) > 1:
+            for i in range(1, len(merged)):
+                other = merged[i]
+                # 计算两个区间之间的距离
+                gap = 0
+                if other[0] > main_interval[1]:
+                    gap = other[0] - main_interval[1]
+                elif main_interval[0] > other[1]:
+                    gap = main_interval[0] - other[1]
+                
+                # 如果存在一个较大的干扰块且距离主列很远，说明该帧不干净
+                if (other[1] - other[0]) > (img_width * 0.02) and gap > MAX_GAP_ALLOWED:
+                    return False
+
+        return True
+
     def dart_fusion(self, vname, frame_list, fwd_tracks, bwd_tracks, dense_dets):
         # 1. 准备漂移数据
         fwd_drift = self.calculate_drift(fwd_tracks, "Forward")
@@ -904,13 +965,41 @@ class DARTPipeline:
             
             return 0.5 * u_consist + 0.3 * u_model + 0.2 * u_drift
 
+        # 【改动 3：定义困难度计算函数】-----------------------------------------
+        def calculate_hardness(final_objs, raw_dets):
+            if not final_objs: return 0.0
+            # 原始没框，全是救回来的 -> 极难
+            if raw_dets is None or len(raw_dets) == 0: return float(len(final_objs))
+            
+            fin_boxes = np.array([x['box'] for x in final_objs])
+            # 计算 IoU
+            iou_matrix = iou_batch(fin_boxes, raw_dets[:, :4])
+            max_ious = np.max(iou_matrix, axis=1) # 每个最终框对应的最大IoU
+            
+            # 权重：漏检(IoU<0.1)=1.0, 精修(0.1<IoU<0.8)=0.5, 简单(IoU>0.8)=0
+            n_rescue = np.sum(max_ious < 0.1)
+            n_refine = np.sum((max_ious >= 0.1) & (max_ious < 0.8))
+            return (n_rescue * 1.0) + (n_refine * 0.5)
+        # ---------------------------------------------------------------------
+
+        gt_fids = set()
+        for item in frame_list:
+            gt_path = os.path.join(Config.GT_DIR, f"{item['stem']}.xml")
+            if os.path.exists(gt_path):
+                gt_fids.add(item['frame_id'])
+        gt_fids_list = sorted(list(gt_fids))
+        
+        print(gt_fids_list)
+        
+        MIN_GAP_FRAMES = 1
+        last_anchor_fid = -999
 
         for item in tqdm(frame_list, desc="Fusing", leave=False):
             fid = item['frame_id']
             
             # --- Manual 帧 (保持不变) ---
-            gt_path = os.path.join(Config.GT_DIR, f"{item['stem']}.xml")
-            if os.path.exists(gt_path):
+            if fid in gt_fids:
+                last_anchor_fid = fid
                 # (略: 保持原有人工帧处理逻辑)
                 continue
 
@@ -1073,6 +1162,9 @@ class DARTPipeline:
                     keep = nms_numpy(boxes, scores, Config.NMS_THRES) # 建议 0.5
                     final_objs = [final_objs[k] for k in keep]
 
+            # if len(final_objs) > 0:
+            #     final_objs = self.clean_edges_conservative(final_objs, w)
+
             # 输出 XML
             if final_objs:
                 # h, w = cv2.imread(item['path']).shape[:2]
@@ -1089,41 +1181,136 @@ class DARTPipeline:
 
                 # write_xml(final_objs, item['path'], os.path.join(Config.OUT_DIR, f"{item['stem']}.xml"), (h,w,3))
 
-            # 完美帧筛选 (基于不确定性)
-            if Config.SAVE_PERFECT_FRAMES and final_objs:
-                # 1. 准备数据 (转为 numpy 数组)
-                final_boxes_arr = np.array([x['box'] for x in final_objs])
-                raw_boxes_arr = dense_dets.get(fid, np.empty((0,5)))
+            # # 完美帧筛选 (基于不确定性)
+            # if Config.SAVE_PERFECT_FRAMES and final_objs:
+            #     # 1. 准备数据 (转为 numpy 数组)
+            #     final_boxes_arr = np.array([x['box'] for x in final_objs])
+            #     raw_boxes_arr = dense_dets.get(fid, np.empty((0,5)))
 
-                # 2. 计算内部质量 (不确定性)
-                divs = [x['div'] for x in final_objs]
-                avg_div = sum(divs) / len(divs)
+            #     # 2. 计算内部质量 (不确定性)
+            #     divs = [x['div'] for x in final_objs]
+            #     avg_div = sum(divs) / len(divs)
                 
-                # 3. [调用] 计算外部一致性 (保留率)
-                # 直接一行代码搞定，不需要自己写循环
-                consistency_rate = self.calculate_consistency_rate(raw_boxes_arr, final_boxes_arr, threshold=0.9)
+            #     # 3. [调用] 计算外部一致性 (保留率)
+            #     # 直接一行代码搞定，不需要自己写循环
+            #     consistency_rate = self.calculate_consistency_rate(raw_boxes_arr, final_boxes_arr, threshold=0.9)
                 
-                # 4. 联合筛选
-                # 条件: 融合质量高 (avg_div < 0.2) 且 CSRT框保留率高 (rate > 0.95)
-                if (len(final_objs) > 5) and (avg_div < 0.2) and (consistency_rate > 0.95):
-                    img = cv2.imread(item['path'])
+            #     # 4. 联合筛选
+            #     # 条件: 融合质量高 (avg_div < 0.2) 且 CSRT框保留率高 (rate > 0.95)
+            #     if (len(final_objs) > 5) and (avg_div < 0.1) and (consistency_rate > 0.98):
+            #         img = cv2.imread(item['path'])
                     
-                    # 画框
-                    for o in final_objs:
-                        x1,y1,x2,y2 = map(int, o['box'])
-                        # 绿色=好, 红色=差
-                        clr = (0,255,0) if o['div'] < 0.15 else (0,0,255)
-                        cv2.rectangle(img, (x1,y1), (x2,y2), clr, 2)
-                        cv2.putText(img, f"{o['score']:.2f}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, clr, 1)
+            #         # 画框
+            #         for o in final_objs:
+            #             x1,y1,x2,y2 = map(int, o['box'])
+            #             # 绿色=好, 红色=差
+            #             clr = (0,255,0) if o['div'] < 0.15 else (0,0,255)
+            #             cv2.rectangle(img, (x1,y1), (x2,y2), clr, 2)
+            #             cv2.putText(img, f"{o['score']:.2f}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, clr, 1)
                     
-                    # 打印信息 Q=Quality, C=Consistency
-                    info = f"Q:{1-avg_div:.2f} C:{consistency_rate:.2f}"
-                    cv2.putText(img, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #         # 打印信息 Q=Quality, C=Consistency
+            #         info = f"Q:{1-avg_div:.2f} C:{consistency_rate:.2f}"
+            #         cv2.putText(img, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     
-                    # 保存
-                    if 300 < item['frame_id'] < frame_list[-1]['frame_id'] - 300:
-                        cv2.imwrite(os.path.join(Config.BEST_FRAMES_DIR, f"{vname}_{item['stem']}_perfect.jpg"), img)
-                        write_xml(final_objs, item['path'], os.path.join(perfect_xml_dir, f"{vname}_{item['stem']}.xml"), (h, w, 3))
+            #         # 保存
+            #         if 300 < item['frame_id'] < frame_list[-1]['frame_id'] - 300:
+            #             cv2.imwrite(os.path.join(Config.BEST_FRAMES_DIR, f"{item['stem']}_perfect.jpg"), img)
+            #             write_xml(final_objs, item['path'], os.path.join(Config.BEST_FRAMES_XML_DIR, f"{item['stem']}.xml"), (h, w, 3))
+
+
+            if Config.SAVE_PERFECT_FRAMES and final_objs and dense_dets.get(fid) is not None:
+                
+                # 1. 基础时空过滤 (Timeline & Spacing)
+                # -------------------------------------------------
+                dist_prev = fid - last_anchor_fid
+                dist_next = 9999
+                for g_fid in gt_fids_list:
+                    if g_fid > fid:
+                        dist_next = g_fid - fid
+                        break
+                
+                is_timeline_safe = 300 < fid < (frame_list[-1]['frame_id'] - 300)
+                # 间隔保持 15 帧 (0.5s)
+                is_spacing_safe = (dist_prev >= 15) and (dist_next >= 15)
+
+                if is_timeline_safe and is_spacing_safe:
+                    
+                    # 2. 提前计算 IoU (为了判断是否有 Rescue)
+                    # -------------------------------------------------
+                    raw_all = dense_dets.get(fid, np.empty((0, 5)))
+                    raw_high_conf = raw_all[raw_all[:, 4] > 0.6] # 只跟高分框比，防止跟低分垃圾框匹配上了
+                    
+                    fin_boxes = np.array([x['box'] for x in final_objs])
+                    
+                    # 默认为 Rescue (假设全没匹配上)
+                    obj_ious = np.zeros(len(final_objs))
+                    
+                    if len(raw_high_conf) > 0 and len(fin_boxes) > 0:
+                        # 计算每个最终框 vs 原始检测框的最大 IoU
+                        iou_matrix = iou_batch(fin_boxes, raw_high_conf)
+                        obj_ious = np.max(iou_matrix, axis=1) 
+                    
+                    # 3. 统计关键指标
+                    # -------------------------------------------------
+                    # [核心] Rescue: IoU < 0.1 且 DART 很确信 (div < 0.15)
+                    # 我们不仅要求是救援框，还要求这个救援框是靠谱的，不是飘来的
+                    n_valid_rescue = 0
+                    for i, o in enumerate(final_objs):
+                        if obj_ious[i] < 0.1 and o['div'] < 0.2:
+                            n_valid_rescue += 1
+
+                    # Refine: 0.1 <= IoU < 0.85 (大幅修正)
+                    n_refine = np.sum((obj_ious >= 0.1) & (obj_ious < 0.85))
+                    
+                    # 整体质量
+                    avg_div = sum(x['div'] for x in final_objs) / len(final_objs)
+                    max_div = max(x['div'] for x in final_objs)
+
+                    # 4. 最终严苛筛选 (Strict Filter)
+                    # -------------------------------------------------
+                    # 条件 A: 必须有至少 1 个靠谱的救援框 (红色)
+                    # 条件 B: 或者有 5 个以上被大幅修正的框 (黄色) -> 这种情况也很有价值，证明原模型位置歪了
+                    # 条件 C: 整体不能太乱 (avg_div < 0.15)
+                    
+                    has_high_value = (n_valid_rescue >= 1) or (n_refine >= 5)
+                    is_clean = (avg_div < 0.15) and (max_div < 0.35) and (len(final_objs) >= 10)
+
+                    is_spatially_consistent = self.is_x_axis_continuous(final_objs, w)
+
+                    if has_high_value and is_clean and is_spatially_consistent:
+                        
+                        # ---> 满足条件，保存！ <---
+                        
+                        base_name = f"{item['stem']}"
+                        img_save = cv2.imread(item['path'])
+                        
+                        # 绘制用于人工复核的图片
+                        for i, o in enumerate(final_objs):
+                            x1, y1, x2, y2 = map(int, o['box'])
+                            iou = obj_ious[i]
+                            
+                            # 配色方案
+                            if iou < 0.1: 
+                                color = (0, 0, 255); thickness = 2 # 🔴 Rescue
+                            elif iou < 0.85: 
+                                color = (0, 215, 255); thickness = 2 # 🟡 Refine
+                            else: 
+                                color = (0, 255, 0); thickness = 1 # 🟢 Easy
+                                
+                            cv2.rectangle(img_save, (x1, y1), (x2, y2), color, thickness)
+
+                        # 在图上标记为什么选这张图
+                        trigger_reason = "Rescue" if n_valid_rescue >= 1 else "Refine"
+                        info = f"Type:{trigger_reason} Rescue:{n_valid_rescue} Refine:{n_refine}"
+                        cv2.putText(img_save, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        
+                        cv2.imwrite(os.path.join(Config.BEST_FRAMES_DIR, f"{base_name}.jpg"), img_save)
+                        write_xml(final_objs, item['path'], os.path.join(Config.BEST_FRAMES_XML_DIR, f"{base_name}.xml"), (h, w, 3))
+                        
+                        # 更新锚点，强制冷却 15 帧
+                        last_anchor_fid = fid
+
+            # =========================================================================
 
             # 可视化
             if vw:
@@ -1161,7 +1348,7 @@ class DARTPipeline:
                     'DJI_0393', 'DJI_0394', 'DJI_0395', 'DJI_0396', 'DJI_0418', 'DJI_0419', 'DJI_0420',
                     'DJI_0421', 'DJI_0447', 'DJI_0448', 'DJI_0449', 'DJI_0450', 'DJI_0451', 'DJI_0452',
                     'DJI_0453', 'DJI_0454', 'DJI_0455', 'DJI_0456', 'DJI_0457', 'DJI_0458', 'DJI_0459',
-                    'DJI_0460','DJI_0476']
+                    'DJI_0460', 'DJI_0476']
         files = sorted(glob.glob(os.path.join(Config.IMG_DIR, "*.jpg")))
         video_dict = defaultdict(list)
         for f in files:
