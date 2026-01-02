@@ -109,8 +109,8 @@ from byte_tracker.tracker.byte_tracker import BYTETracker
 # -----------------------------------------------------------
 class Config:
     # [关键路径配置]
-    IMG_DIR = "../ALL_JPEG"                # 图片文件夹
-    GT_DIR = "./VOCdevkit/VOC2007/Annotations"              # 【优先级1】人工真值文件夹 (绝对锚点)
+    IMG_DIR = "/home/caozhenzhen/xiaomai/ALL_JPEG"                # 图片文件夹
+    GT_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main/VOCdevkit/VOC2007/Annotations"              # 【优先级1】人工真值文件夹 (绝对锚点)
     YOLO_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main-modify/predict_low_conf/xml"         # 【优先级2】YOLO检测文件夹 (自动检测)
 
     OUT_DIR = "predict_final_dart"  # 最终输出结果
@@ -118,7 +118,7 @@ class Config:
 
     # ================= [新增缓存配置] =================
     USE_CACHE = True                # 是否启用缓存
-    CACHE_DIR = "dart_cache_new"        # 缓存文件存放目录
+    CACHE_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main/dart_cache_new"        # 缓存文件存放目录
     FORCE_REBUILD = False           # 设为 True 可强制重新运行 CSRT (忽略已有缓存)
 
     # [DART 完美帧筛选]
@@ -133,7 +133,7 @@ class Config:
     TRUST_LIMIT = 30.0              # [救援] 距离锚点多少帧以内视为可信
 
     # 数据增强参数
-    ANCHOR_CONF_THRES = 0.8         # 模型分 > 0.8 视为锚点
+    ANCHOR_CONF_THRES = 0.6         # 模型分 > 0.8 视为锚点
     MANUAL_SCORE = 2.0              # 人工标注的强制分数 (远超模型分)
 
     # SOT & NMS
@@ -486,7 +486,7 @@ class SOTGenerator:
     def run(self, frame_list, direction="Forward"):
         iter_list = frame_list if direction == "Forward" else frame_list[::-1]
         results = {}
-        trackers = []
+        trackers = [] # 结构: {tracker, score, is_alive, drift, last_box}
         
         # =========================================================
         # [极简参数配置]
@@ -495,7 +495,7 @@ class SOTGenerator:
         MAX_TTL = 60        # 高召回：允许盲跑 2 秒
         
         # [内置策略阈值]
-        RESET_SCORE_THRES = 0.6  # YOLO分 > 0.7 时强制重置 (防止飘移)
+        RESET_SCORE_THRES = 0.5  # YOLO分 > 0.7 时强制重置 (防止飘移)
         BORDER_MARGIN = 15       # 边缘禁区 (防止边缘堆积)
         SCORE_DECAY = 0.95       # 盲跑衰减 (解决大框套小框，让旧框变弱)
         MATCH_THRES = 0.3        # 宽松匹配
@@ -525,10 +525,12 @@ class SOTGenerator:
             # -------------------------------------------------------
             # Step 1: 预测更新 (含边缘查杀 & 分数衰减)
             # -------------------------------------------------------
-            active_idxs = []; pred_boxes = []
+            active_idxs = []
+            pred_boxes = []
             
             for idx, trk in enumerate(trackers):
                 trk['no_match_count'] += 1
+                trk['drift'] += 1  # 【修改点】盲跑一帧，不确定度+1
                 
                 # [策略] 分数衰减：解决大框套小框的核心
                 # 盲跑的框分数会越来越低，在 NMS 和冲突检查中处于劣势
@@ -582,6 +584,7 @@ class SOTGenerator:
                             t_obj.init(img_small, ibox)
                             trackers[idx]['tracker'] = t_obj
                             trackers[idx]['last_box'] = d_box # 坐标对齐
+                            trackers[idx]['drift'] = 0 # 【修改点】对齐了真值/高分，Drift 归零
                         
                         # 无论是否重置，分数都要回血，计数清零
                         trackers[idx]['score'] = d_box[4]
@@ -628,7 +631,8 @@ class SOTGenerator:
                     
                     trackers.append({
                         'tracker': t_obj, 'score': d_box[4],
-                        'is_alive': True, 'no_match_count': 0, 'last_box': d_box
+                        'is_alive': True, 'no_match_count': 0, 'last_box': d_box,
+                        'drift': 0 # 【修改点】新生的框，Drift为0
                     })
 
             # -------------------------------------------------------
@@ -643,17 +647,18 @@ class SOTGenerator:
                     del t['tracker']
             trackers = new_trackers
             
+            out_candidates = []
             if is_manual:
-                results[item['frame_id']] = dets
+                for d in dets:
+                    out_candidates.append(list(d) + [0])
             else:
-                out_candidates = []
-                for d in dets: out_candidates.append(d)
                 for t in trackers:
                     # [策略] 过滤低分：盲跑太久分太低的，不输出给 NMS，减少干扰
                     if 'last_box' in t and t['score'] > 0.15: 
-                        out_candidates.append(np.array(t['last_box']))
-                results[item['frame_id']] = np.array(out_candidates) if out_candidates else np.empty((0, 5))
-            
+                        box = list(t['last_box'][:5]) + [t['drift']]
+                        out_candidates.append(np.array(box))
+            results[item['frame_id']] = np.array(out_candidates) if out_candidates else np.empty((0, 6))
+
             pbar.set_postfix({"Active": len(trackers)})
 
         return results
@@ -678,19 +683,20 @@ class DARTPipeline:
         return_dict[direction] = res
 
     def prepare_dense_detections(self, vname, frame_list):
-        cache_path = os.path.join(Config.CACHE_DIR, f"{vname}_tracks.pkl")
+        fwd_cache_path = os.path.join(Config.CACHE_DIR, f"{vname}_fwd.pkl")
+        bwd_cache_path = os.path.join(Config.CACHE_DIR, f"{vname}_bwd.pkl")
         
         fwd_res = None
         bwd_res = None
         
         # 1. 尝试读取缓存
-        if Config.USE_CACHE and not Config.FORCE_REBUILD and os.path.exists(cache_path):
+        if Config.USE_CACHE and not Config.FORCE_REBUILD and os.path.exists(fwd_cache_path) and os.path.exists(bwd_cache_path):
             print(f"  [Cache] Found cache for {vname}, loading...")
             try:
-                with open(cache_path, 'rb') as f:
-                    data = pickle.load(f)
-                    fwd_res = data['fwd_res']
-                    bwd_res = data['bwd_res']
+                with open(fwd_cache_path, 'rb') as f:
+                    fwd_res = pickle.load(f)
+                with open(bwd_cache_path, 'rb') as f:
+                    bwd_res = pickle.load(f)
                 print(f"  [Cache] Loaded successfully! Skipping CSRT & ByteTrack.")
             except Exception as e:
                 print(f"  [Cache] Error loading cache: {e}. Re-running...")
@@ -733,8 +739,8 @@ class DARTPipeline:
         
         for item in tqdm(all_fids, desc="Stage 1: Merging & NMS", leave=False):
             fid = item['frame_id']
-            cands_f = fwd_res.get(fid, np.empty((0,5)))
-            cands_b = bwd_res.get(fid, np.empty((0,5)))
+            cands_f = fwd_res.get(fid, np.empty((0,6)))
+            cands_b = bwd_res.get(fid, np.empty((0,6)))
             
             if len(cands_f) > 0 and len(cands_b) > 0:
                 all_cands = np.vstack((cands_f, cands_b))
@@ -742,7 +748,7 @@ class DARTPipeline:
                 all_cands = cands_f
             elif len(cands_b) > 0:
                 all_cands = cands_b
-            else: all_cands = np.empty((0,5))
+            else: all_cands = np.empty((0,6))
             
             if len(all_cands) > 0:
                 conf_mask = all_cands[:, 4] > 0.1
@@ -754,7 +760,7 @@ class DARTPipeline:
                 keep = nms_numpy(all_cands[:,:4], all_cands[:,4], Config.NMS_THRES)
                 dense_dets[fid] = all_cands[keep]
             else:
-                dense_dets[fid] = np.empty((0,5))
+                dense_dets[fid] = np.empty((0,6))
 
             if Config.VISUALIZE:
                 # 注意：频繁读取图片和写入会降低速度，调试完建议注释掉
@@ -791,8 +797,9 @@ class DARTPipeline:
 
         for item in tqdm(iter_list, desc=f"Stage 2: Tracking {direction}", leave=False):
             fid = item['frame_id']
-            dets = detections.get(fid, np.empty((0,5)))
-            
+            dets = detections.get(fid, np.empty((0,6)))
+            if dets.shape[1] > 5:
+                dets = dets[:, :5]
             targets = []
             if len(dets) > 0:
                 targets = tracker.update(dets, [h, w], [h, w])
