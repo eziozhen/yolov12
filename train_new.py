@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # 务必设置 mosaic=0.0，关闭原本的几何增强
     model.train(
         data="coco.yaml", 
-        epochs=300,
+        epochs=200,
         batch=16,
         imgsz=640,
         # # --- 1. 关闭几何变换 ---
@@ -114,7 +114,7 @@ if __name__ == "__main__":
         # hsv_h=0.0,       # 色调
         # hsv_s=0.0,       # 饱和度
         # hsv_v=0.0,       # 亮度
-        
+
         # # --- 3. 关闭空间随机性 ---
         # degrees=0.0,     # 旋转
         # translate=0.0,   # 平移

@@ -8,14 +8,14 @@ model = YOLO('yolov12s.yaml')
 # Train the model
 results = model.train(
   data='coco.yaml',
-  epochs=200, 
-  batch=16, 
+  epochs=100, 
+  batch=16,
   imgsz=640,
-  # # --- 1. 关闭几何变换 ---
-  # mosaic=0.0,      # 关闭马赛克
-  # mixup=0.0,       # 关闭混合
+  # --- 1. 关闭几何变换 ---
+  mosaic=0.0,      # 关闭马赛克
+  mixup=0.0,       # 关闭混合
   copy_paste=0.0,  # 关闭复制粘贴
-  
+
   # # --- 2. 关闭色彩/光照变换 ---
   # hsv_h=0.0,       # 色调
   # hsv_s=0.0,       # 饱和度
