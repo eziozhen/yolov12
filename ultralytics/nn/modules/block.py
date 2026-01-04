@@ -56,9 +56,11 @@ __all__ = (
 
 class MTI_Block(nn.Module):
     """
-    MTI-Net Block (Best Version: Decoupled & Aligned)
-    1. 解耦：主路特征纯净增强，辅路特征加噪重建 (解决掉点)
-    2. 对齐：输入 N 张图 -> 输出 N 张图 (解决报错)
+    MTI-Net Block V4 (Anti-Shortcut Version)
+    核心改进：
+    1. Delta Query: 强制辅助任务复用主路参数，杜绝任务割裂。
+    2. Zero-Init: 保证接入初期不掉点。
+    3. Stable Gate: 门控初始化偏置，优先信任当前帧。
     """
     def __init__(self, c1, c2, seq_len=5, num_heads=8):
         super().__init__()
@@ -75,21 +77,50 @@ class MTI_Block(nn.Module):
         # 时序位置编码
         self.temporal_embed = nn.Parameter(torch.zeros(1, seq_len, c1, 1, 1))
         
-        # 2. STIA: 时序交互组件
-        self.stia_gamma = nn.Parameter(torch.zeros(1))
+        # --- 优化点 1: Gated Fusion (更稳健的初始化) ---
+        self.fusion_gate = nn.Sequential(
+            nn.Conv2d(c1 * 2, c1, 1),
+            nn.GELU(),
+            nn.Conv2d(c1, 1, 1),
+            nn.Sigmoid()
+        )
+        # 初始化技巧：让 Gate 初始输出偏向 0 (即只保留当前帧)
+        # 这样训练初期相当于该模块不存在，随着训练进行逐渐引入历史信息
+        nn.init.constant_(self.fusion_gate[-2].bias, -2.0) 
         
-        # 投影层 (标准 Multi-Head Attention)
-        self.q_proj = nn.Linear(c1, c1)
+        # --- 优化点 2: Delta Query (防止走捷径的核心) ---
+        self.q_proj_main = nn.Linear(c1, c1) 
+        
+        # 不再使用独立的 rec query，而是学习一个 delta
+        self.q_proj_delta = nn.Linear(c1, c1)
+        # Delta 层必须零初始化！
+        nn.init.zeros_(self.q_proj_delta.weight)
+        nn.init.zeros_(self.q_proj_delta.bias)
+        
         self.k_proj = nn.Linear(c1, c1)
         self.v_proj = nn.Linear(c1, c1)
-        
-        # 辅助任务专用重建头 (不影响主网络参数)
-        self.reconstruct_head = nn.Linear(c1, c1)
-        
-        # 输出卷积
+
+        # --- 信息瓶颈 (重建头) ---
+        self.reconstruct_head = nn.Sequential(
+            nn.Linear(c1, c1 // 4),
+            nn.GELU(),
+            nn.Linear(c1 // 4, c1)
+        )
+
+        # --- 优化点 3: ConvFFN (增强非线性) ---
+        hidden_dim = c1 * 4
+        self.conv_ffn = nn.Sequential(
+            nn.Conv2d(c1, hidden_dim, 1),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, groups=hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, c1, 1),
+            nn.Dropout(0.1) if self.training else nn.Identity()
+        )
+        # 零初始化 Gamma，保证残差流的纯净
+        self.ffn_gamma = nn.Parameter(torch.zeros(1))
+
+        # 输出层
         self.out_conv = nn.Conv2d(c1, c2, 1)
-        
-        # 归一化
         self.norm = nn.LayerNorm(c1)
         
         # 缓存
@@ -97,108 +128,92 @@ class MTI_Block(nn.Module):
         self.batch_data = None
 
     def forward(self, x, labels=None):
-        """
-        Args:
-            x: (BT, C, H, W)
-        Returns:
-            out: (BT, C2, H, W) - 维度严格对齐
-        """
         BT, C, H, W = x.shape
         T = self.seq_len
-        
-        # 清空 loss 缓存
         self.loss_data = None
 
-        
-        # 判定: 维度是否符合序列要求?
+        # --- 维度对齐逻辑 ---
         is_seq_shape = (BT > 0) and (BT % T == 0)
-        is_training = self.training
-
         if is_seq_shape:
-            # ---> 训练模式: 拆分 Batch 和 Time
             B = BT // T
-            # (B*T, C, H, W) -> (B, T, C, H, W) -> (B, C, T, H, W)
             x_seq = x.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
         else:
-            # ---> 推理模式 / Stride计算: 自动填充 (Auto-Padding)
-            # 将单张图复制 T 次，伪装成视频
             B = BT
-            # (B, C, H, W) -> (B, 1, C, H, W) -> expand -> (B, C, T, H, W)
             x_seq = x.unsqueeze(1).expand(-1, T, -1, -1, -1).permute(0, 2, 1, 3, 4).contiguous()
-            
-            # 推理时强制清空标签
             labels = None 
-            if hasattr(self, 'batch_data'):
-                delattr(self, 'batch_data')
-
-        # ============================================================
-        # 3. 时序增强 (MTI Enhancement)
-        # ============================================================
+            if hasattr(self, 'batch_data'): delattr(self, 'batch_data')
 
         # --- TCE ---
         x_pos = self.pos_perceiver(x_seq) + x_seq
-        
-        # (B, T, H, W, C) for addition
         feat = x_pos.permute(0, 2, 3, 4, 1).contiguous() 
         feat = feat + self.temporal_embed.permute(0, 1, 3, 4, 2)
 
-        # --- 特征拆分 ---
-        # MTI 的核心就是只输出当前帧 (t)，利用历史帧 (hist) 做增强
-        f_t_raw = feat[:, -1, :, :, :]      # (B, H, W, C)
-        f_hist_raw = feat[:, :-1, :, :, :]  # (B, T-1, H, W, C)
+        # --- Split ---
+        f_t_raw = feat[:, -1, :, :, :]
+        f_hist_raw = feat[:, :-1, :, :, :]
 
-        # LayerNorm
         f_t = self.norm(f_t_raw)
         f_hist = self.norm(f_hist_raw)
 
-        # --- Attention 准备 ---
+        # --- Shared K, V ---
         kv_in = f_hist.reshape(B, (T - 1) * H * W, C)
         k = self.k_proj(kv_in).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.v_proj(kv_in).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         # ============================================================
-        # Path A: 主增强路径 (Main Path) - 纯净流
+        # Path A: Main Path (Detection)
         # ============================================================
-        q_clean = self.q_proj(f_t.reshape(B, H*W, C)).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        
-        # 原始 Attention 逻辑
+        q_clean = self.q_proj_main(f_t.reshape(B, H*W, C)).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q_clean, k, v)
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, H, W, C)
         
-        # 残差回加
-        f_enhanced = f_t_raw + self.stia_gamma * attn_out 
+        # --- Gated Fusion ---
+        x_curr = f_t_raw.permute(0, 3, 1, 2)
+        x_attn = attn_out.permute(0, 3, 1, 2)
         
+        # Gate: 动态决定融合比例
+        gate_map = self.fusion_gate(torch.cat([x_curr, x_attn], dim=1))
+        f_fused = x_curr + gate_map * x_attn
+
+        # --- ConvFFN ---
+        f_out = f_fused + self.ffn_gamma * self.conv_ffn(f_fused)
+
         # ============================================================
-        # Path B: 辅助路径 (Aux Path) - Loss 计算
+        # Path B: Aux Path (Anti-Shortcut Training)
         # ============================================================
         if labels is None: labels = getattr(self, 'batch_data', None)
 
-        # 只有训练且有 label 时才计算 Loss
         if self.training and labels is not None:
             mask = self.generate_mask(f_t.permute(0, 3, 1, 2), labels)
             if mask is not None:
                 mask_bool = mask.permute(0, 2, 3, 1) > 0.5
                 
-                # 噪声注入
-                noise = torch.randn_like(f_t)
+                # 强噪声注入 (Noise Intensity 0.5 ~ 1.5)
+                # 只有噪声够大，网络才会被迫去依赖历史信息
+                noise = torch.randn_like(f_t) * 1.0 
                 f_corrupted = torch.where(mask_bool, noise, f_t)
                 
-                # 脏 Attention
-                q_dirty = self.q_proj(f_corrupted.reshape(B, H*W, C)).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-                rec_out = F.scaled_dot_product_attention(q_dirty, k, v)
+                # [关键优化] Delta Query 计算
+                # Q_rec = Q_main(dirty) + Q_delta(dirty)
+                # 这迫使 Q_main 必须具备一定的鲁棒性，否则 Q_rec 根本学不好
+                x_dirty_flat = f_corrupted.reshape(B, H*W, C)
                 
-                # 重建 Loss 目标
+                q_base = self.q_proj_main(x_dirty_flat) # 复用主路参数
+                q_delta = self.q_proj_delta(x_dirty_flat) # 学习残差
+                
+                q_dirty = (q_base + q_delta).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+                
+                rec_out = F.scaled_dot_product_attention(q_dirty, k, v)
                 rec_pred = self.reconstruct_head(rec_out.permute(0, 2, 1, 3).reshape(B, H*W, C))
                 
-                self.loss_data = (rec_pred, f_t.reshape(B, H*W, C), mask_bool.reshape(B, H*W).unsqueeze(-1))
+                # Target Detach (防崩塌)
+                target_feat = f_t.detach()
+                
+                self.loss_data = (rec_pred, target_feat.reshape(B, H*W, C), mask_bool.reshape(B, H*W).unsqueeze(-1))
 
-        # ============================================================
-        # 3. 输出 (严格按照你的要求: B, C, H, W)
-        # ============================================================
-        # (B, H, W, C) -> (B, C, H, W) -> OutConv -> (B, C2, H, W)
-        out = self.out_conv(f_enhanced.permute(0, 3, 1, 2))
-        
-        return out
+        # Output
+        return self.out_conv(f_out)
+
     def generate_mask(self, x, batch_data):
         # 保持你的 Mask 生成逻辑不变
         if batch_data is None: return None

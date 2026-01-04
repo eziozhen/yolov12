@@ -938,6 +938,29 @@ class DARTPipeline:
 
         return True
 
+    # ================= [新增] YOLO 保留率计算 =================
+    def calculate_yolo_retention(self, raw_boxes, final_objs, iou_thresh=0.25):
+        """
+        计算 YOLO 原始检测框在最终结果中的保留率。
+        """
+        if raw_boxes is None or len(raw_boxes) == 0: return 1.0 # YOLO 没框，默认保留 100%
+        if not final_objs: return 0.0 # YOLO 有框但 DART 没框，保留率 0%
+            
+        raw_locs = raw_boxes[:, :4]
+        final_locs = np.array([x['box'] for x in final_objs])
+        
+        # 批量计算 IoU (Row: Final, Col: Raw) -> 输出 Shape (N_final, N_raw)
+        iou_matrix = iou_batch(final_locs, raw_locs) 
+        
+        # 对每一个 Raw 框（列），找被 Final 匹配的最大 IoU
+        max_ious_per_raw = np.max(iou_matrix, axis=0) 
+        
+        # 统计被保留的比例
+        retained_count = np.sum(max_ious_per_raw > iou_thresh)
+        
+        return retained_count / len(raw_boxes)
+    # ==========================================================
+
     def dart_fusion(self, vname, frame_list, fwd_tracks, bwd_tracks, dense_dets):
         # 1. 准备漂移数据
         fwd_drift = self.calculate_drift(fwd_tracks, "Forward")
@@ -1242,10 +1265,16 @@ class DARTPipeline:
 
                 if is_timeline_safe and is_spacing_safe:
                     
-                    # 2. 提前计算 IoU (为了判断是否有 Rescue)
-                    # -------------------------------------------------
-                    raw_all = dense_dets.get(fid, np.empty((0, 5)))
-                    raw_high_conf = raw_all[raw_all[:, 4] > 0.6] # 只跟高分框比，防止跟低分垃圾框匹配上了
+                    yolo_xml_path = os.path.join(Config.YOLO_DIR, f"{item['stem']}.xml")
+                    raw_yolo = read_xml(yolo_xml_path)
+                    retention = self.calculate_yolo_retention(raw_yolo, final_objs, iou_thresh=0.25)
+                    
+                    if retention < 0.95:
+                        # 丢弃该帧：说明 DART 过滤掉了太多 YOLO 认为存在的物体
+                        continue 
+                    # ==========================================
+                    
+                    raw_high_conf = raw_yolo[raw_yolo[:, 4] > 0.6] 
                     
                     fin_boxes = np.array([x['box'] for x in final_objs])
                     
@@ -1279,13 +1308,14 @@ class DARTPipeline:
                     # 条件 B: 或者有 5 个以上被大幅修正的框 (黄色) -> 这种情况也很有价值，证明原模型位置歪了
                     # 条件 C: 整体不能太乱 (avg_div < 0.15)
                     
-                    has_high_value = (n_valid_rescue >= 1) or (n_refine >= 5)
+                    has_high_value = (n_valid_rescue >= 1) or (n_refine >= 2)
                     is_clean = (avg_div < 0.15) and (max_div < 0.35) and (len(final_objs) >= 10)
 
                     is_spatially_consistent = self.is_x_axis_continuous(final_objs, w)
+                    
+                    is_stable = (avg_div < 0.10) and (retention > 0.95)
 
-                    if has_high_value and is_clean and is_spatially_consistent:
-                        
+                    if (has_high_value or is_stable) and is_clean and is_spatially_consistent:
                         # ---> 满足条件，保存！ <---
                         
                         base_name = f"{item['stem']}"
