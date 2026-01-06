@@ -59,7 +59,7 @@ class VideoTrainer(DetectionTrainer):
 if __name__ == "__main__":
     # 1. 加载模型
     model = YOLO("yolov13s.yaml")  # 或 yolov8n.pt 等
-    
+
     # 13s aug 0.916
     # 13s no aug 0.861
     # 13s no aug T=5 0.87
