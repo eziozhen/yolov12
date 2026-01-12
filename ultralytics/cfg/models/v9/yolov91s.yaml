@@ -1,0 +1,58 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLOv9s object detection model with MTI_Block & TemporalSlice
+# Based on YOLOv9s GELAN backbone
+
+# Parameters
+nc: 80 # number of classes
+
+# GELAN backbone (保持不变)
+backbone:
+  - [-1, 1, Conv, [32, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [64, 3, 2]] # 1-P2/4
+  - [-1, 1, ELAN1, [64, 64, 32]] # 2
+  - [-1, 1, AConv, [128]] # 3-P3/8
+  - [-1, 1, RepNCSPELAN4, [128, 128, 64, 3]] # 4 (Backbone P3) - Output: 128 channels
+  - [-1, 1, AConv, [192]] # 5-P4/16
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 3]] # 6 (Backbone P4) - Output: 192 channels
+  - [-1, 1, AConv, [256]] # 7-P5/32
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 3]] # 8
+  - [-1, 1, SPPELAN, [256, 128]] # 9 (Backbone P5) - Output: 256 channels
+
+# YOLOv9s head (添加 MTI 和 TemporalSlice)
+head:
+  # --------------------------------------------------------
+  # Step 1: 预处理 Backbone 的三个输出层
+  # --------------------------------------------------------
+  - [-1, 1, MTI_Block, [256, 5, 8]] # 10: 处理 Backbone P5 (来自 Layer 9)
+  # - [-1, 1, TemporalSlice, [5]]    # 10: 处理 Backbone P5 (来自 Layer 9)
+  - [6, 1, MTI_Block, [192, 5, 4]] # 11: 处理 Backbone P4 (来自 Layer 6)
+                                   # 注意: 参数设为 192 以匹配 v9s Layer 6 的输出
+  - [4, 1, TemporalSlice, [5]]     # 12: 处理 Backbone P3 (来自 Layer 4)
+
+  # --------------------------------------------------------
+  # Step 2: FPN (Top-down)
+  # --------------------------------------------------------
+  - [10, 1, nn.Upsample, [None, 2, "nearest"]] # 13: 上采样 P5 (注意来源是 10)
+  - [[-1, 11], 1, Concat, [1]]             # 14: Cat 上采样后的P5 + 处理后的P4 (11)
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 3]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 16: 上采样 P4
+  - [[-1, 12], 1, Concat, [1]]             # 17: Cat 上采样后的P4 + 处理后的P3 (12)
+  - [-1, 1, RepNCSPELAN4, [128, 128, 64, 3]] # 18 (Head P3/8-small)
+
+  # --------------------------------------------------------
+  # Step 3: PAN (Bottom-up)
+  # --------------------------------------------------------
+  - [-1, 1, AConv, [96]]                   # 19: 下采样
+  - [[-1, 15], 1, Concat, [1]]             # 20: Cat Head P4 (Layer 15)
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 3]] # 21 (Head P4/16-medium)
+
+  - [-1, 1, AConv, [128]]                  # 22: 下采样
+  - [[-1, 10], 1, Concat, [1]]             # 23: Cat 处理后的P5 (Layer 10)
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 3]] # 24 (Head P5/32-large)
+
+  # --------------------------------------------------------
+  # Step 4: Detect
+  # --------------------------------------------------------
+  - [[18, 21, 24], 1, Detect, [nc]] # Detect(P3, P4, P5)

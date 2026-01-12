@@ -1,0 +1,82 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RT-DETR-s object detection model with MTI (P4+P5) & Slice (P3)
+# Based on RT-DETR-l scaled to Small (depth=0.33, width=0.50)
+
+# Parameters
+nc: 1  # number of classes
+depth_multiple: 0.33  # scales module repeats
+width_multiple: 0.50  # scales convolution channels
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, HGStem, [32, 48]]  # 0-P2/4
+  - [-1, 6, HGBlock, [48, 128, 3]]  # stage 1
+
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]]  # 2-P3/8
+  - [-1, 6, HGBlock, [96, 512, 3]]   # 3 (Backbone P3) -> Scaled: 256ch
+
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]]  # 4-P3/16
+  - [-1, 6, HGBlock, [192, 1024, 5, True, False]]  # cm, c2, k, light, shortcut
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]  # 7 (Backbone P4) -> Scaled: 512ch
+
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]]  # 8-P4/32
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]]  # 9 (Backbone P5) -> Scaled: 1024ch
+
+head:
+  # =========================================================
+  # Step 1: 拦截 Backbone 输出 (时序预处理)
+  # =========================================================
+  
+  # P5: Layer 9 -> MTI
+  # 参数写原始值 2048，系统会自动乘以 width_multiple(0.5) = 1024
+  - [9, 1, MTI_Block, [2048, 5, 4]] # 10: MTI P5
+  
+  # P4: Layer 7 -> MTI
+  # 参数写原始值 1024，缩放后 = 512
+  - [7, 1, MTI_Block, [1024, 5, 4]] # 11: MTI P4
+  
+  # P3: Layer 3 -> Slice
+  - [3, 1, TemporalSlice, [5]]      # 12: Slice P3
+
+  # =========================================================
+  # Step 2: Hybrid Encoder (CCFM) - 重新路由
+  # =========================================================
+
+  # --- P5 Branch (Top) ---
+  # 原版连 -1 (Layer 9)，现在连 Layer 10 (MTI P5)
+  - [10, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 13: input_proj.2
+  - [-1, 1, AIFI, [1024, 8]]                       # 14
+  - [-1, 1, Conv, [256, 1, 1]]                     # 15: Y5
+
+  # --- P4 Branch (Middle) ---
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]     # 16
+  # 原版连 7，现在连 Layer 11 (MTI P4)
+  - [11, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 17: input_proj.1
+  - [[-2, -1], 1, Concat, [1]]                     # 18
+  - [-1, 3, RepC3, [256]]                          # 19: fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]]                     # 20: Y4
+
+  # --- P3 Branch (Bottom) ---
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]     # 21
+  # 原版连 3，现在连 Layer 12 (Slice P3)
+  - [12, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 22: input_proj.0
+  - [[-2, -1], 1, Concat, [1]]                     # 23
+  - [-1, 3, RepC3, [256]]                          # 24: X3 (P3 Output)
+
+  # --- PAN (Bottom-up) ---
+  - [-1, 1, Conv, [256, 3, 2]]   # 25: downsample_convs.0
+  # 原版连 17(Y4)，现在是 Layer 20
+  - [[-1, 20], 1, Concat, [1]]   # 26: cat Y4
+  - [-1, 3, RepC3, [256]]        # 27: F4 (P4 Output)
+
+  - [-1, 1, Conv, [256, 3, 2]]   # 28: downsample_convs.1
+  # 原版连 12(Y5)，现在是 Layer 15
+  - [[-1, 15], 1, Concat, [1]]   # 29: cat Y5
+  - [-1, 3, RepC3, [256]]        # 30: F5 (P5 Output)
+
+  # =========================================================
+  # Step 3: Decoder
+  # =========================================================
+  # 来源索引更新：X3(24), F4(27), F5(30)
+  - [[24, 27, 30], 1, RTDETRDecoder, [nc]]  # Detect(P3, P4, P5)

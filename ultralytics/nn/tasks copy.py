@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.modules import (
-    CBAM,
     MTI_Block,
     TemporalSlice,
     AIFI,
@@ -538,13 +537,13 @@ class RTDETRDetectionModel(DetectionModel):
         bs_input = len(img) # B * T
 
         # 1. 获取 n_history
-        n_history = 1
-        # if n_history == 0:
-        #     # 自动推导兜底策略：如果 batch 是 5 的倍数且 > 16 (根据你的实际情况调整)
-        #     if bs_input >= 5 and bs_input % 5 == 0:
-        #         n_history = 5 # 假设是 5 (4历史+1当前)
-        #     else:
-        #         n_history = 1
+        n_history = 0
+        if n_history == 0:
+            # 自动推导兜底策略：如果 batch 是 5 的倍数且 > 16 (根据你的实际情况调整)
+            if bs_input >= 5 and bs_input % 5 == 0:
+                n_history = 5 # 假设是 5 (4历史+1当前)
+            else:
+                n_history = 1
 
         # 计算实际的 Batch Size (B)，例如 40 // 5 = 8
         bs = bs_input // n_history if n_history > 1 else bs_input

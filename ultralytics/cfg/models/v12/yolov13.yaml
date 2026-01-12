@@ -28,8 +28,10 @@ backbone:
 
 # YOLO12-turbo head
 head:
-  - [-1, 1, MTI_Block, [1024, 5, 8]] # 9
-  - [6, 1, TemporalSlice, [5]] # 10   slice P4
+  - [-1, 1, MTI_Block, [1024, 5, 4]] # 9 P5
+  # - [-1, 1, TemporalSlice, [5]] # 9   slice P5
+  # - [6, 1, TemporalSlice, [5]] # 10   slice P4
+  - [6, 1, MTI_Block, [512, 5, 4]]   # 10   slice P4
   - [4, 1, TemporalSlice, [5]] # 11   slice P3
 
   - [9, 1, nn.Upsample, [None, 2, "nearest"]] # 12

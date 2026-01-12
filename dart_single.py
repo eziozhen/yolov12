@@ -113,8 +113,8 @@ class Config:
     GT_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main/VOCdevkit/VOC2007/Annotations"              # 【优先级1】人工真值文件夹 (绝对锚点)
     YOLO_DIR = "/home/caozhenzhen/xiaomai/yolov5-pytorch-main-modify/predict_low_conf/xml"         # 【优先级2】YOLO检测文件夹 (自动检测)
 
-    OUT_DIR = "dart/predict_final_dart"  # 最终输出结果
-    VIS_DIR_S1 = "dart/vis_stage1_nms"
+    OUT_DIR = "dart_single/predict_final_dart"  # 最终输出结果
+    VIS_DIR_S1 = "dart_single/vis_stage1_nms"
 
     # ================= [新增缓存配置] =================
     USE_CACHE = True                # 是否启用缓存
@@ -123,8 +123,8 @@ class Config:
 
     # [DART 完美帧筛选]
     SAVE_PERFECT_FRAMES = True
-    BEST_FRAMES_DIR = "dart/dart_perfect_samples"
-    BEST_FRAMES_XML_DIR = "dart/dart_perfect_samples_xml"
+    BEST_FRAMES_DIR = "dart_single/dart_perfect_samples"
+    BEST_FRAMES_XML_DIR = "dart_single/dart_perfect_samples_xml"
     PERFECT_FRAME_DIV = 0.1        # 代表正向跟踪和反向跟踪结果之间的“散度”（Divergence）。0.05 意味着正反向轨迹的 IoU（交并比）必须高于 0.95。
 
     # [核心] 算法阈值
@@ -149,7 +149,7 @@ class Config:
 
     # 可视化
     VISUALIZE = False
-    VIS_DIR = "dart/vis_dart"
+    VIS_DIR = "dart_single/vis_dart"
 
 # -----------------------------------------------------------
 # 基础工具函数
@@ -708,13 +708,13 @@ class DARTPipeline:
             manager = Manager()
             return_dict = manager.dict()
             p1 = Process(target=self.run_sot_process, args=(frame_list, "Forward", return_dict))
-            p2 = Process(target=self.run_sot_process, args=(frame_list, "Backward", return_dict))
+            # p2 = Process(target=self.run_sot_process, args=(frame_list, "Backward", return_dict))
             p1.start()
-            p2.start()
+            # p2.start()
             p1.join()
-            p2.join()
+            # p2.join()
             fwd_res = return_dict["Forward"]
-            bwd_res = return_dict["Backward"]
+            bwd_res = {}
 
             # gen = SOTGenerator()
             # fwd_res = gen.run(frame_list, "Forward")
@@ -740,15 +740,17 @@ class DARTPipeline:
         for item in tqdm(all_fids, desc="Stage 1: Merging & NMS", leave=False):
             fid = item['frame_id']
             cands_f = fwd_res.get(fid, np.empty((0,6)))
-            cands_b = bwd_res.get(fid, np.empty((0,6)))
+            # cands_b = bwd_res.get(fid, np.empty((0,6)))
             
-            if len(cands_f) > 0 and len(cands_b) > 0:
-                all_cands = np.vstack((cands_f, cands_b))
-            elif len(cands_f) > 0:
-                all_cands = cands_f
-            elif len(cands_b) > 0:
-                all_cands = cands_b
-            else: all_cands = np.empty((0,6))
+            # if len(cands_f) > 0 and len(cands_b) > 0:
+            #     all_cands = np.vstack((cands_f, cands_b))
+            # elif len(cands_f) > 0:
+            #     all_cands = cands_f
+            # elif len(cands_b) > 0:
+            #     all_cands = cands_b
+            # else: all_cands = np.empty((0,6))
+            
+            all_cands = cands_f
             
             if len(all_cands) > 0:
                 conf_mask = all_cands[:, 4] > 0.1
@@ -916,9 +918,9 @@ class DARTPipeline:
         MAX_GAP_ALLOWED = img_width * 0.05 # 允许最大 5% 宽度的断裂
         MIN_MAIN_COL_WIDTH = img_width * 0.15 # 主列至少要占 15% 宽度
 
-        # # 判定 A: 主列是否太窄
-        # if main_len < MIN_MAIN_COL_WIDTH:
-        #     return False
+        # 判定 A: 主列是否太窄
+        if main_len < MIN_MAIN_COL_WIDTH:
+            return False
 
         # 判定 B: 是否存在严重的侧边干扰 (Gap 检查)
         # 如果有多个区间，检查主区间与其他区间之间的空隙
@@ -931,7 +933,7 @@ class DARTPipeline:
                     gap = other[0] - main_interval[1]
                 elif main_interval[0] > other[1]:
                     gap = main_interval[0] - other[1]
-
+                
                 # 如果存在一个较大的干扰块且距离主列很远，说明该帧不干净
                 if (other[1] - other[0]) > (img_width * 0.02) and gap > MAX_GAP_ALLOWED:
                     return False
@@ -964,7 +966,7 @@ class DARTPipeline:
     def dart_fusion(self, vname, frame_list, fwd_tracks, bwd_tracks, dense_dets):
         # 1. 准备漂移数据
         fwd_drift = self.calculate_drift(fwd_tracks, "Forward")
-        bwd_drift = self.calculate_drift(bwd_tracks, "Backward")
+        # bwd_drift = self.calculate_drift(bwd_tracks, "Backward")
         
         h, w = cv2.imread(frame_list[0]['path']).shape[:2]
         
@@ -985,15 +987,9 @@ class DARTPipeline:
         
         # [新增] 综合不确定性计算函数 (0.0~1.0, 越低越好)
         def get_uncertainty(iou_score, conf_score, drift):
-            # 1. 一致性不确定度 (权重0.5): IoU高->0, IoU低->1
-            u_consist = 1.0 - iou_score
-            # 2. 模型不确定度 (权重0.3): 分高->0, 分低->1
-            u_model = 1.0 - conf_score
-            # 3. 漂移不确定度 (权重0.2): 刚对过答案->0, 盲跑久了->1
-            # 这里的 30 是经验值，对应 Config.TRUST_LIMIT
-            u_drift = min(drift, 30.0) / 30.0
-            
-            return 0.5 * u_consist + 0.3 * u_model + 0.2 * u_drift
+            # 单向版：没有 iou_score (设为0)，主要靠 drift 和 conf
+            # 给一个基础惩罚 0.1，因为没有双向验证
+            return 0.1 + 0.4 * (1.0 - conf_score) + 0.5 * (min(drift, 30.0) / 30.0)
 
         # 【改动 3：定义困难度计算函数】-----------------------------------------
         def calculate_hardness(final_objs, raw_dets):
@@ -1035,116 +1031,116 @@ class DARTPipeline:
 
             # --- DART 融合逻辑 (改写为求并集) ---
             f_objs = fwd_by_frame[fid]
-            b_objs = bwd_by_frame[fid]
+            # b_objs = bwd_by_frame[fid]
             final_objs = []
             
-            used_f = set(); used_b = set()
+            # used_f = set(); used_b = set()
             
-            # A. 处理交集 (Intersection) -> 高精度
-            if f_objs and b_objs:
-                f_boxes = np.array([x['box'] for x in f_objs])
-                b_boxes = np.array([x['box'] for x in b_objs])
-                iou = iou_batch(f_boxes, b_boxes)
-                r_ind, c_ind = linear_sum_assignment(-iou)
+            # # A. 处理交集 (Intersection) -> 高精度
+            # if f_objs and b_objs:
+            #     f_boxes = np.array([x['box'] for x in f_objs])
+            #     b_boxes = np.array([x['box'] for x in b_objs])
+            #     iou = iou_batch(f_boxes, b_boxes)
+            #     r_ind, c_ind = linear_sum_assignment(-iou)
                 
-                for r, c in zip(r_ind, c_ind):
-                    current_iou = iou[r, c]
+            #     for r, c in zip(r_ind, c_ind):
+            #         current_iou = iou[r, c]
 
-                    # 获取基本信息
-                    box_f = f_objs[r]['box']
-                    box_b = b_objs[c]['box']
+            #         # 获取基本信息
+            #         box_f = f_objs[r]['box']
+            #         box_b = b_objs[c]['box']
                     
-                    # ---------------------------------------------------------
-                    # 1. 计算面积与 IoMin (只算一次)
-                    # ---------------------------------------------------------
-                    w_f = box_f[2] - box_f[0]; h_f = box_f[3] - box_f[1]
-                    area_f = w_f * h_f
+            #         # ---------------------------------------------------------
+            #         # 1. 计算面积与 IoMin (只算一次)
+            #         # ---------------------------------------------------------
+            #         w_f = box_f[2] - box_f[0]; h_f = box_f[3] - box_f[1]
+            #         area_f = w_f * h_f
                     
-                    w_b = box_b[2] - box_b[0]; h_b = box_b[3] - box_b[1]
-                    area_b = w_b * h_b
+            #         w_b = box_b[2] - box_b[0]; h_b = box_b[3] - box_b[1]
+            #         area_b = w_b * h_b
                     
-                    # 计算交集面积
-                    xx1 = max(box_f[0], box_b[0]); yy1 = max(box_f[1], box_b[1])
-                    xx2 = min(box_f[2], box_b[2]); yy2 = min(box_f[3], box_b[3])
-                    w_inter = max(0, xx2 - xx1); h_inter = max(0, yy2 - yy1)
-                    area_inter = w_inter * h_inter
+            #         # 计算交集面积
+            #         xx1 = max(box_f[0], box_b[0]); yy1 = max(box_f[1], box_b[1])
+            #         xx2 = min(box_f[2], box_b[2]); yy2 = min(box_f[3], box_b[3])
+            #         w_inter = max(0, xx2 - xx1); h_inter = max(0, yy2 - yy1)
+            #         area_inter = w_inter * h_inter
                     
-                    # IoMin
-                    min_area = min(area_f, area_b)
-                    io_min = area_inter / (min_area + 1e-6)
+            #         # IoMin
+            #         min_area = min(area_f, area_b)
+            #         io_min = area_inter / (min_area + 1e-6)
                     
-                    # ---------------------------------------------------------
-                    # 2. 融合决策
-                    # ---------------------------------------------------------
-                    # 准入条件：IoU合格 OR 包含关系显著
-                    if current_iou > 0.5 or io_min > 0.8:
-                        df = fwd_drift[f_objs[r]['tid']].get(fid, 100.0)
-                        db = bwd_drift[b_objs[c]['tid']].get(fid, 100.0)
+            #         # ---------------------------------------------------------
+            #         # 2. 融合决策
+            #         # ---------------------------------------------------------
+            #         # 准入条件：IoU合格 OR 包含关系显著
+            #         if current_iou > 0.5 or io_min > 0.8:
+            #             df = fwd_drift[f_objs[r]['tid']].get(fid, 100.0)
+            #             db = bwd_drift[b_objs[c]['tid']].get(fid, 100.0)
                         
-                        # [紧致化融合 Tight Fusion]
-                        # 直接使用上面算好的面积
-                        ratio = area_f / (area_b + 1e-6)
+            #             # [紧致化融合 Tight Fusion]
+            #             # 直接使用上面算好的面积
+            #             ratio = area_f / (area_b + 1e-6)
                         
-                        if ratio > 1.3: 
-                            final_box = box_b # F太大(可能是泥土)，强制选B
-                        elif ratio < 0.7: 
-                            final_box = box_f # B太大，强制选F
-                        else:
-                            # 大小差不多，维纳过程加权
-                            w_f = 1.0 / (df + 1e-6); w_b = 1.0 / (db + 1e-6)
-                            final_box = (w_f * box_f + w_b * box_b) / (w_f + w_b)
+            #             if ratio > 1.3: 
+            #                 final_box = box_b # F太大(可能是泥土)，强制选B
+            #             elif ratio < 0.7: 
+            #                 final_box = box_f # B太大，强制选F
+            #             else:
+            #                 # 大小差不多，维纳过程加权
+            #                 w_f = 1.0 / (df + 1e-6); w_b = 1.0 / (db + 1e-6)
+            #                 final_box = (w_f * box_f + w_b * box_b) / (w_f + w_b)
                         
-                        final_score = max(f_objs[r]['score'], b_objs[c]['score'])
-                        min_drift = min(df, db)
+            #             final_score = max(f_objs[r]['score'], b_objs[c]['score'])
+            #             min_drift = min(df, db)
                         
-                        # [关键修复] 计算不确定性时，承认"包含"也是一种高度一致
-                        # 如果是 IoU=0.2 但 IoMin=0.9，我们应该认为一致性是 0.9
-                        effective_consistency = max(current_iou, io_min)
+            #             # [关键修复] 计算不确定性时，承认"包含"也是一种高度一致
+            #             # 如果是 IoU=0.2 但 IoMin=0.9，我们应该认为一致性是 0.9
+            #             effective_consistency = max(current_iou, io_min)
                         
-                        unc = get_uncertainty(effective_consistency, final_score, min_drift)
+            #             unc = get_uncertainty(effective_consistency, final_score, min_drift)
                         
-                        # 奖励：如果一致性极高，直接给完美分
-                        if effective_consistency > 0.9: unc = 0.05
+            #             # 奖励：如果一致性极高，直接给完美分
+            #             if effective_consistency > 0.9: unc = 0.05
                         
-                        final_objs.append({
-                            'box': final_box, 
-                            'score': final_score, 
-                            'id': f_objs[r]['tid'], 
-                            'div': unc
-                        })
-                        used_f.add(r); used_b.add(c)
+            #             final_objs.append({
+            #                 'box': final_box, 
+            #                 'score': final_score, 
+            #                 'id': f_objs[r]['tid'], 
+            #                 'div': unc
+            #             })
+            #             used_f.add(r); used_b.add(c)
 
             # B. 处理差集 (Union) -> 高召回
             # 也就是"单侧补全"，只保留靠谱的
             
             # Forward 剩余
             for i, obj in enumerate(f_objs):
-                if i not in used_f:
-                    df = fwd_drift[obj['tid']].get(fid, 100.0)
-                    # 筛选：漂移不能太离谱 (<30帧)
-                    if df < Config.TRUST_LIMIT:
-                        # 单侧意味着 IoU=0 (一致性极差)，所以不确定性会偏高
-                        # 但如果 drift 很小 (刚出现/刚跟丢)，我们给它打折
-                        base_unc = get_uncertainty(0.0, obj['score'], df)
-                        if df <= 10: base_unc = 0.1 # 免死金牌：刚出现的算准的
-                        
-                        final_objs.append({
-                            'box': obj['box'], 'score': obj['score'], 
-                            'id': obj['tid'], 'div': base_unc
-                        })
+                # if i not in used_f:
+                df = fwd_drift[obj['tid']].get(fid, 100.0)
+                # 筛选：漂移不能太离谱 (<30帧)
+                if df < Config.TRUST_LIMIT:
+                    # 单侧意味着 IoU=0 (一致性极差)，所以不确定性会偏高
+                    # 但如果 drift 很小 (刚出现/刚跟丢)，我们给它打折
+                    base_unc = get_uncertainty(0.0, obj['score'], df)
+                    if df <= 10: base_unc = 0.1 # 免死金牌：刚出现的算准的
+                    
+                    final_objs.append({
+                        'box': obj['box'], 'score': obj['score'], 
+                        'id': obj['tid'], 'div': base_unc
+                    })
 
-            # Backward 剩余
-            for i, obj in enumerate(b_objs):
-                if i not in used_b:
-                    db = bwd_drift[obj['tid']].get(fid, 100.0)
-                    if db < Config.TRUST_LIMIT:
-                        base_unc = get_uncertainty(0.0, obj['score'], db)
-                        if db <= 10: base_unc = 0.1
+            # # Backward 剩余
+            # for i, obj in enumerate(b_objs):
+            #     if i not in used_b:
+            #         db = bwd_drift[obj['tid']].get(fid, 100.0)
+            #         if db < Config.TRUST_LIMIT:
+            #             base_unc = get_uncertainty(0.0, obj['score'], db)
+            #             if db <= 10: base_unc = 0.1
                         
-                        final_objs.append({
-                            'box': obj['box'], 'score': obj['score'], 
-                            'id': obj['tid'], 'div': base_unc
-                        })
+            #             final_objs.append({
+            #                 'box': obj['box'], 'score': obj['score'], 
+            #                 'id': obj['tid'], 'div': base_unc
+            #             })
 
             # C. 最终去重 (Final NMS)
             # 因为求了并集，可能存在正反向没匹配上但物理重叠的框，需要清理
@@ -1211,6 +1207,43 @@ class DARTPipeline:
 
                 # write_xml(final_objs, item['path'], os.path.join(Config.OUT_DIR, f"{item['stem']}.xml"), (h,w,3))
 
+            # # 完美帧筛选 (基于不确定性)
+            # if Config.SAVE_PERFECT_FRAMES and final_objs:
+            #     # 1. 准备数据 (转为 numpy 数组)
+            #     final_boxes_arr = np.array([x['box'] for x in final_objs])
+            #     raw_boxes_arr = dense_dets.get(fid, np.empty((0,5)))
+
+            #     # 2. 计算内部质量 (不确定性)
+            #     divs = [x['div'] for x in final_objs]
+            #     avg_div = sum(divs) / len(divs)
+                
+            #     # 3. [调用] 计算外部一致性 (保留率)
+            #     # 直接一行代码搞定，不需要自己写循环
+            #     consistency_rate = self.calculate_consistency_rate(raw_boxes_arr, final_boxes_arr, threshold=0.9)
+                
+            #     # 4. 联合筛选
+            #     # 条件: 融合质量高 (avg_div < 0.2) 且 CSRT框保留率高 (rate > 0.95)
+            #     if (len(final_objs) > 5) and (avg_div < 0.1) and (consistency_rate > 0.98):
+            #         img = cv2.imread(item['path'])
+                    
+            #         # 画框
+            #         for o in final_objs:
+            #             x1,y1,x2,y2 = map(int, o['box'])
+            #             # 绿色=好, 红色=差
+            #             clr = (0,255,0) if o['div'] < 0.15 else (0,0,255)
+            #             cv2.rectangle(img, (x1,y1), (x2,y2), clr, 2)
+            #             cv2.putText(img, f"{o['score']:.2f}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, clr, 1)
+                    
+            #         # 打印信息 Q=Quality, C=Consistency
+            #         info = f"Q:{1-avg_div:.2f} C:{consistency_rate:.2f}"
+            #         cv2.putText(img, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+            #         # 保存
+            #         if 300 < item['frame_id'] < frame_list[-1]['frame_id'] - 300:
+            #             cv2.imwrite(os.path.join(Config.BEST_FRAMES_DIR, f"{item['stem']}_perfect.jpg"), img)
+            #             write_xml(final_objs, item['path'], os.path.join(Config.BEST_FRAMES_XML_DIR, f"{item['stem']}.xml"), (h, w, 3))
+
+
             if Config.SAVE_PERFECT_FRAMES and final_objs and dense_dets.get(fid) is not None:
                 
                 # 1. 基础时空过滤 (Timeline & Spacing)
@@ -1222,9 +1255,9 @@ class DARTPipeline:
                         dist_next = g_fid - fid
                         break
                 
-                is_timeline_safe = 240 < fid < (frame_list[-1]['frame_id'] - 240)
+                is_timeline_safe = 300 < fid < (frame_list[-1]['frame_id'] - 300)
                 # 间隔保持 15 帧 (0.5s)
-                is_spacing_safe = (dist_prev >= 12) and (dist_next >= 12)
+                is_spacing_safe = (dist_prev >= 15) and (dist_next >= 15)
 
                 if is_timeline_safe and is_spacing_safe:
                     
@@ -1232,11 +1265,11 @@ class DARTPipeline:
                     raw_yolo = read_xml(yolo_xml_path)
                     retention = self.calculate_yolo_retention(raw_yolo, final_objs, iou_thresh=0.25)
                     
-                    if retention < 0.90:
+                    if retention < 0.913:
                         # 丢弃该帧：说明 DART 过滤掉了太多 YOLO 认为存在的物体
-                        continue
+                        continue 
                     # ==========================================
-
+                    
                     raw_high_conf = raw_yolo[raw_yolo[:, 4] > 0.6] 
                     
                     fin_boxes = np.array([x['box'] for x in final_objs])
@@ -1255,7 +1288,7 @@ class DARTPipeline:
                     # 我们不仅要求是救援框，还要求这个救援框是靠谱的，不是飘来的
                     n_valid_rescue = 0
                     for i, o in enumerate(final_objs):
-                        if obj_ious[i] < 0.1 and o['div'] < 0.25:
+                        if obj_ious[i] < 0.1 and o['div'] < 0.2:
                             n_valid_rescue += 1
 
                     # Refine: 0.1 <= IoU < 0.85 (大幅修正)
@@ -1272,15 +1305,15 @@ class DARTPipeline:
                     # 条件 C: 整体不能太乱 (avg_div < 0.15)
                     
                     has_high_value = (n_valid_rescue >= 1) or (n_refine >= 2)
-                    is_clean = (avg_div < 0.15) and (max_div < 0.45) and (len(final_objs) >= 10)
+                    is_clean = (avg_div < 0.30) and (max_div < 0.35) and (len(final_objs) >= 10)
 
                     is_spatially_consistent = self.is_x_axis_continuous(final_objs, w)
                     
-                    is_stable = (avg_div < 0.20) and (retention > 0.95)
+                    is_stable = (avg_div < 0.30) and (retention > 0.85)
 
                     if (has_high_value or is_stable) and is_clean and is_spatially_consistent:
                         # ---> 满足条件，保存！ <---
-
+                        
                         base_name = f"{item['stem']}"
                         img_save = cv2.imread(item['path'])
                         
@@ -1335,7 +1368,8 @@ class DARTPipeline:
         
         # (B) Stage 2: 双向 ByteTrack
         fwd_tracks = self.run_tracking(frames, dense_dets, "Forward")
-        bwd_tracks = self.run_tracking(frames, dense_dets, "Backward")
+        # bwd_tracks = self.run_tracking(frames, dense_dets, "Backward")
+        bwd_tracks = {}
 
         return fwd_tracks, bwd_tracks, dense_dets
 

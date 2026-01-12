@@ -57,8 +57,11 @@ class VideoTrainer(DetectionTrainer):
         return dataset
 
 if __name__ == "__main__":
+    # setup_seed(42) # 选一个吉利的数字
     # 1. 加载模型
     model = YOLO("yolov13s.yaml")  # 或 yolov8n.pt 等
+    
+    # torch.backends.cudnn.benchmark = False 
 
     # 13s aug 0.916
     # 13s no aug 0.861
@@ -105,6 +108,9 @@ if __name__ == "__main__":
         epochs=200,
         batch=16,
         imgsz=640,
+        seed=42,
+        cos_lr=True,
+        # amp=True,
         # # --- 1. 关闭几何变换 ---
         mosaic=0.0,      # 关闭马赛克
         mixup=0.0,       # 关闭混合
@@ -128,7 +134,6 @@ if __name__ == "__main__":
         rect=False,      # 训练时通常为 False (转为正方形)，这也符合你的 LetterBox 逻辑
         cache=False,     # 关闭缓存，防止干扰
         plots=False,
-        # amp=False,
         # freeze=10,
         workers=32
     )
