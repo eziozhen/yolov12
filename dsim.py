@@ -338,108 +338,131 @@ class ForcedAlignmentDetector:
 
     def process(self, raw_boxes):
         """
-        [智能试探填充版]
+        [弹性公差稳定版]
         
-        响应用户：
-        1. 解决“碰撞检测太死板”的问题。
-        2. 引入“抖动探测” (Nudging)：在尝试放置虚拟苗时，不仅试探行中心，
-           还会尝试向上、向下微调坐标。只要能在微调范围内找到一个不碰撞的位置，就判定放置成功。
-        3. 保持迭代式推进：放下一个后，从新框右边继续。
+        解决痛点：
+        1. 解决视频帧间统计量 (P75) 微小波动导致检测时有时无的问题。
+        2. 引入 'size_tolerance' (0.85)：只要空隙达到标准苗的 85% 大小，就允许填入。
+           (这模拟了植物的弹性，也抵消了检测框的抖动误差)
         """
         if len(raw_boxes) < 2: return [], [], 0
         
-        # 1. 锁定 Angle = 0
+        # 1. 基础数据
         angle = 0.0 
         props = self.get_rotated_data(raw_boxes, angle)
-        
-        # 2. 分行
         lanes = self.assign_lanes_forced(raw_boxes)
         
         final_missing = []
         labels = np.zeros(len(raw_boxes), dtype=int)
         
-        # --- [步骤 A] 确定“标准虚拟苗”尺寸 ---
+        # --- [步骤 A] 统计全图数据 ---
         all_widths = [p['w'] for p in props]
         all_heights = [p['h'] for p in props]
         if not all_widths: return [], [], 0
 
-        # 使用 75 分位数构建标准框 (大苗标准)
+        # 1. 确定标准尺寸 (P75)
         p75_w = np.percentile(all_widths, 75)
         p75_h = np.percentile(all_heights, 75)
-        
-        # 虚拟框尺寸：取宽高的最大值构建正方形，保证占位足够
         virtual_size = max(p75_w, p75_h)
         
-        # --- [步骤 B] 定义抖动范围 ---
-        # 允许上下浮动的范围。比如允许偏移 25% 的苗高。
-        # 如果在这个范围内能找到空位，就算成功。
-        nudge_range = virtual_size * 0.25 
-        # 定义尝试的偏移量：[0, -5, +5, -10, +10...]
-        # 优先试中间，不行试两边
+        # [关键修改] 定义宽容系数
+        # 0.85 意味着：只要空隙有 85% 的虚拟框那么大，就认为能塞进去
+        # 这给了 15% 的 Buffer 抵抗统计波动
+        size_tolerance = 0.90
+        
+        # 2. 统计全田边界
+        lane_starts = []
+        lane_ends = []
+        for lid, items in lanes.items():
+            if not items: continue
+            items.sort(key=lambda x: x['rot_x'])
+            lane_starts.append(items[0]['rot_x'] - items[0]['w'] / 2)
+            lane_ends.append(items[-1]['rot_x'] + items[-1]['w'] / 2)
+            
+        if not lane_starts: return [], [], 0
+        
+        global_start_x = np.percentile(lane_starts, 25)
+        global_end_x = np.percentile(lane_ends, 75)
+        
+        # 抖动探测参数
+        nudge_range = virtual_size * 0.25
         nudge_offsets = [0, -nudge_range * 0.5, nudge_range * 0.5, -nudge_range, nudge_range]
 
-        # 3. 逐行处理
-        for lid, items in lanes.items():
-            if len(items) < 2: continue
+        # --- [内部函数] 通用填空逻辑 ---
+        def fill_gap_between(start_edge, end_edge, base_y):
+            current_edge = start_edge
             
+            # [关键修改] 判定条件放宽
+            # 原来：end_edge - current_edge >= virtual_size
+            # 现在：乘以 tolerance。Gap 只要大于 0.85 个身位，就进循环。
+            while end_edge - current_edge >= virtual_size * size_tolerance:
+                
+                # 尝试放置的位置：依然按标准尺寸算中心，或者按实际剩余空间微调
+                # 这里我们按标准尺寸的一半来定中心，这样更规整
+                virtual_cx = current_edge + virtual_size / 2
+                
+                placed_success = False
+                best_y = base_y
+                
+                # 智能抖动探测
+                for offset_y in nudge_offsets:
+                    test_y = base_y + offset_y
+                    
+                    # 碰撞检测框：稍微收缩一点(0.9)，避免边缘摩擦
+                    vw, vh = virtual_size, virtual_size
+                    scale = 0.9
+                    vbox = [virtual_cx - vw*scale/2, test_y - vh*scale/2, 
+                            virtual_cx + vw*scale/2, test_y + vh*scale/2]
+                    
+                    if not self.check_collision(vbox, raw_boxes):
+                        placed_success = True
+                        best_y = test_y
+                        break 
+                
+                if placed_success:
+                    final_missing.append([virtual_cx, best_y])
+                    
+                    # [关键保持] 游标推进依然推满一个标准身位
+                    # 为什么？因为虽然我挤进来了，但不能让后面的人也跟着挤。
+                    # 我们假设这个坑已经被一个标准苗占了。
+                    current_edge += virtual_size 
+                else:
+                    # 遇到障碍，跳过半个身位
+                    current_edge += virtual_size * 0.5
+                    
+        # --- [步骤 B] 逐行检测 ---
+        for lid, items in lanes.items():
+            if len(items) < 1: continue
             for p in items: labels[p['id']] = lid
             items.sort(key=lambda x: x['rot_x'])
             
-            # --- [步骤 C] 迭代式填充 + 智能试探 ---
+            if len(items) >= 2:
+                row_ys = [p['rot_y'] for p in items]
+                row_mean_y = np.median(row_ys)
+            else:
+                row_mean_y = items[0]['rot_y']
+
+            # Phase 1: 补头
+            first_item_left = items[0]['rot_x'] - items[0]['w'] / 2
+            # 同样应用 tolerance，防止边界处刚好处在临界值
+            if first_item_left > global_start_x + virtual_size * 0.5:
+                fill_gap_between(global_start_x, first_item_left, row_mean_y)
+            
+            # Phase 2: 补中
             for k in range(len(items) - 1):
                 curr = items[k]
                 next_box = items[k+1]
                 
-                # 起始边缘 (左苗的右边)
-                current_edge = curr['rot_x'] + curr['w'] / 2
-                # 终点边缘 (右苗的左边)
-                gap_end = next_box['rot_x'] - next_box['w'] / 2
+                curr_right = curr['rot_x'] + curr['w'] / 2
+                next_left = next_box['rot_x'] - next_box['w'] / 2
                 
-                # 行的基准中心 Y
-                base_row_y = (curr['rot_y'] + next_box['rot_y']) / 2
+                local_y = (curr['rot_y'] + next_box['rot_y']) / 2
+                fill_gap_between(curr_right, next_left, local_y)
                 
-                # 循环填空
-                while gap_end - current_edge >= virtual_size:
-                    
-                    # 尝试放置的 X 中心
-                    virtual_cx = current_edge + virtual_size / 2
-                    
-                    # [核心修改] 抖动探测 (Nudging Check)
-                    placed_success = False
-                    best_y = base_row_y
-                    
-                    for offset_y in nudge_offsets:
-                        # 尝试一个新的 Y 坐标
-                        test_y = base_row_y + offset_y
-                        
-                        # 构建测试框
-                        vw, vh = virtual_size, virtual_size
-                        # 这里把测试框稍微缩小一点点(比如0.9倍)，防止边缘刚好擦边导致的误判
-                        # 物理上我们允许稍微有一点点挨着
-                        scale = 0.9 
-                        vbox = [virtual_cx - vw*scale/2, test_y - vh*scale/2, 
-                                virtual_cx + vw*scale/2, test_y + vh*scale/2]
-                        
-                        # 碰撞检测
-                        if not self.check_collision(vbox, raw_boxes):
-                            # 找到了！这个位置不碰撞
-                            placed_success = True
-                            best_y = test_y
-                            break # 只要找到一个能放的位置，就停止尝试
-                    
-                    if placed_success:
-                        # 记录这个微调后的最佳位置
-                        final_missing.append([virtual_cx, best_y])
-                        
-                        # 成功占位：墙往右推
-                        current_edge += virtual_size
-                    else:
-                        # [重要] 如果所有位置都试过了还是碰撞
-                        # 说明这里有个障碍物（杂草/误检框）挡得严严实实
-                        # 我们不能死循环，必须跳过这个障碍物
-                        # 策略：稍微往右移动一点点（比如 1/3 个身位），看看能不能避开
-                        # 这样可以防止死锁，也能尝试在障碍物后面找空隙
-                        current_edge += virtual_size * 0.5
+            # Phase 3: 补尾
+            last_item_right = items[-1]['rot_x'] + items[-1]['w'] / 2
+            if last_item_right < global_end_x - virtual_size * 0.5:
+                fill_gap_between(last_item_right, global_end_x, row_mean_y)
 
         return final_missing, labels, angle
 
