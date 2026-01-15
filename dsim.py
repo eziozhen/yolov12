@@ -329,18 +329,21 @@ class ForcedAlignmentDetector:
 
     def process(self, raw_boxes):
         """
-        [弹性公差稳定版]
+        [全域互斥 + 优先级版]
         
-        解决痛点：
-        1. 解决视频帧间统计量 (P75) 微小波动导致检测时有时无的问题。
-        2. 引入 'size_tolerance' (0.85)：只要空隙达到标准苗的 85% 大小，就允许填入。
-           (这模拟了植物的弹性，也抵消了检测框的抖动误差)
+        解决用户痛点：
+        1. 防止缺苗框互相重叠 (Vertical Collision of Missing Boxes)。
+        2. 引入两轮扫描机制 (Two-Pass Strategy)：
+           - Pass 1: 优先计算“补中 (Body)”，确保行内缺苗先占坑。
+           - Pass 2: 后计算“补头/尾 (Head/Tail)”，防止边缘延伸出的红叉覆盖了正常的缺苗。
+        3. 实时更新障碍物列表：生成的缺苗立刻变为障碍物，后续检测必须避开它。
         """
         if len(raw_boxes) < 2: return [], [], 0
         
         # 1. 基础数据
         angle = 0.0 
         props = self.get_rotated_data(raw_boxes, angle)
+        # 使用强力分行
         lanes = self.assign_lanes_forced(raw_boxes)
         
         final_missing = []
@@ -351,17 +354,13 @@ class ForcedAlignmentDetector:
         all_heights = [p['h'] for p in props]
         if not all_widths: return [], [], 0
 
-        # 1. 确定标准尺寸 (P75)
+        # 标准尺寸 (P75)
         p75_w = np.percentile(all_widths, 75)
         p75_h = np.percentile(all_heights, 75)
         virtual_size = max(p75_w, p75_h)
+        size_tolerance = 0.85
         
-        # [关键修改] 定义宽容系数
-        # 0.85 意味着：只要空隙有 85% 的虚拟框那么大，就认为能塞进去
-        # 这给了 15% 的 Buffer 抵抗统计波动
-        size_tolerance = 0.90
-        
-        # 2. 统计全田边界
+        # 统计全田边界
         lane_starts = []
         lane_ends = []
         for lid, items in lanes.items():
@@ -379,17 +378,16 @@ class ForcedAlignmentDetector:
         nudge_range = virtual_size * 0.25
         nudge_offsets = [0, -nudge_range * 0.5, nudge_range * 0.5, -nudge_range, nudge_range]
 
-        # --- [内部函数] 通用填空逻辑 ---
+        # [关键] 动态障碍物列表
+        # 除了 raw_boxes，我们还要把新生成的 missing boxes 也加进来作为障碍
+        # 格式：[xmin, ymin, xmax, ymax]
+        generated_obstacles = []
+
+        # --- [内部函数] 增强版填空逻辑 ---
         def fill_gap_between(start_edge, end_edge, base_y):
             current_edge = start_edge
             
-            # [关键修改] 判定条件放宽
-            # 原来：end_edge - current_edge >= virtual_size
-            # 现在：乘以 tolerance。Gap 只要大于 0.85 个身位，就进循环。
             while end_edge - current_edge >= virtual_size * size_tolerance:
-                
-                # 尝试放置的位置：依然按标准尺寸算中心，或者按实际剩余空间微调
-                # 这里我们按标准尺寸的一半来定中心，这样更规整
                 virtual_cx = current_edge + virtual_size / 2
                 
                 placed_success = False
@@ -399,31 +397,58 @@ class ForcedAlignmentDetector:
                 for offset_y in nudge_offsets:
                     test_y = base_y + offset_y
                     
-                    # 碰撞检测框：稍微收缩一点(0.9)，避免边缘摩擦
+                    # 构建测试框
                     vw, vh = virtual_size, virtual_size
                     scale = 0.9
                     vbox = [virtual_cx - vw*scale/2, test_y - vh*scale/2, 
                             virtual_cx + vw*scale/2, test_y + vh*scale/2]
                     
-                    if not self.check_collision(vbox, raw_boxes):
-                        placed_success = True
-                        best_y = test_y
-                        break 
+                    # [核心修改] 双重碰撞检测
+                    # 1. 检查是否撞到真实物体 (raw_boxes)
+                    if self.check_collision(vbox, raw_boxes):
+                        continue # 撞真苗，换个位置试
+                        
+                    # 2. 检查是否撞到刚才生成的缺苗 (generated_obstacles)
+                    # check_collision 函数需要支持传入自定义列表，或者我们在这里手动查
+                    # 假设 self.check_collision 只能查 raw_boxes，我们手动查 generated_obstacles
+                    collision_with_generated = False
+                    for ob in generated_obstacles:
+                        # simple intersection check
+                        # ob = [xmin, ymin, xmax, ymax]
+                        # vbox = [xmin, ymin, xmax, ymax]
+                        if not (vbox[2] < ob[0] or vbox[0] > ob[2] or vbox[3] < ob[1] or vbox[1] > ob[3]):
+                            collision_with_generated = True
+                            break
+                    
+                    if collision_with_generated:
+                        continue # 撞到别的红叉了，换个位置试
+                    
+                    # 通过所有检测
+                    placed_success = True
+                    best_y = test_y
+                    break 
                 
                 if placed_success:
+                    # 记录缺苗点
                     final_missing.append([virtual_cx, best_y])
                     
-                    # [关键保持] 游标推进依然推满一个标准身位
-                    # 为什么？因为虽然我挤进来了，但不能让后面的人也跟着挤。
-                    # 我们假设这个坑已经被一个标准苗占了。
+                    # [关键] 立即将其加入障碍物列表！
+                    # 这样下一个循环或者下一行检测时，就会避开它
+                    vw, vh = virtual_size, virtual_size
+                    new_ob = [virtual_cx - vw/2, best_y - vh/2, 
+                              virtual_cx + vw/2, best_y + vh/2]
+                    generated_obstacles.append(new_ob)
+                    
                     current_edge += virtual_size 
                 else:
-                    # 遇到障碍，跳过半个身位
                     current_edge += virtual_size * 0.5
-                    
-        # --- [步骤 B] 逐行检测 ---
+        
+        # --- [步骤 B] 优先级执行策略 ---
+        
+        # 预处理：计算每行的 Y 均值和排序
+        lane_meta = {}
         for lid, items in lanes.items():
-            if len(items) < 1: continue
+            if not items: continue
             for p in items: labels[p['id']] = lid
             items.sort(key=lambda x: x['rot_x'])
             
@@ -432,25 +457,38 @@ class ForcedAlignmentDetector:
                 row_mean_y = np.median(row_ys)
             else:
                 row_mean_y = items[0]['rot_y']
-
-            # Phase 1: 补头
-            first_item_left = items[0]['rot_x'] - items[0]['w'] / 2
-            # 同样应用 tolerance，防止边界处刚好处在临界值
-            if first_item_left > global_start_x + virtual_size * 0.5:
-                fill_gap_between(global_start_x, first_item_left, row_mean_y)
             
-            # Phase 2: 补中
+            lane_meta[lid] = {
+                'items': items,
+                'mean_y': row_mean_y
+            }
+
+        # === PASS 1: 高优先级 - 补中 (Body) ===
+        # 先把行中间的确切缺苗补上，让它们先占坑
+        for lid, meta in lane_meta.items():
+            items = meta['items']
             for k in range(len(items) - 1):
                 curr = items[k]
                 next_box = items[k+1]
                 
                 curr_right = curr['rot_x'] + curr['w'] / 2
                 next_left = next_box['rot_x'] - next_box['w'] / 2
-                
                 local_y = (curr['rot_y'] + next_box['rot_y']) / 2
-                fill_gap_between(curr_right, next_left, local_y)
                 
-            # Phase 3: 补尾
+                fill_gap_between(curr_right, next_left, local_y)
+
+        # === PASS 2: 低优先级 - 补头/尾 (Head/Tail) ===
+        # 这些是猜测性的延伸，如果发现位置已经被 Pass 1 占了，它们就会自动失败
+        for lid, meta in lane_meta.items():
+            items = meta['items']
+            row_mean_y = meta['mean_y']
+            
+            # Head
+            first_item_left = items[0]['rot_x'] - items[0]['w'] / 2
+            if first_item_left > global_start_x + virtual_size * 0.5:
+                fill_gap_between(global_start_x, first_item_left, row_mean_y)
+                
+            # Tail
             last_item_right = items[-1]['rot_x'] + items[-1]['w'] / 2
             if last_item_right < global_end_x - virtual_size * 0.5:
                 fill_gap_between(last_item_right, global_end_x, row_mean_y)
