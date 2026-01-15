@@ -178,110 +178,101 @@ class ForcedAlignmentDetector:
 
     def assign_lanes_forced(self, raw_boxes):
         """
-        [直方图优化版 - 高斯平滑 + 显著性寻峰]
-        解决：
-        1. 两行合一行 -> 降低最小间距限制，利用显著性区分。
-        2. 一行分两色 -> 使用高斯模糊抹平波峰顶端的微小抖动。
+        [强力分行版] 解决两行合并为一行的问题
+        
+        核心逻辑：
+        1. 按照 Y 轴坐标对所有框进行排序。
+        2. 动态计算“换行阈值”：使用全图苗高度的 0.6 倍。
+           (如果两个框 Y 轴距离超过 0.6 个苗高，判定为换行)
+        3. 单次扫描切分，不再使用复杂的聚类算法，避免参数敏感。
         """
         if len(raw_boxes) == 0: return {}
         
-        # 1. 霍夫变换算角度并旋转
-        # angle = self.calculate_global_angle(raw_boxes)
-        angle = 0.0
-        props = self.get_rotated_data(raw_boxes, angle)
+        # 1. 准备数据：计算中心点和高度
+        # data =List of [id, cx, cy, w, h]
+        # 注意：这里我们假设 raw_boxes 格式是 [xmin, ymin, xmax, ymax]
+        # 如果你的格式不同，请相应调整
+        items = []
+        for i, box in enumerate(raw_boxes):
+            xmin, ymin, xmax, ymax = box[:4]
+            cx = (xmin + xmax) / 2
+            cy = (ymin + ymax) / 2
+            w = xmax - xmin
+            h = ymax - ymin
+            items.append({'id': i, 'cx': cx, 'cy': cy, 'w': w, 'h': h, 
+                          'rot_x': cx, 'rot_y': cy}) # 兼容后续逻辑的键名
 
-        if not props: return {}
+        # 2. 计算全局统计量 (用于确定切分阈值)
+        all_heights = [p['h'] for p in items]
+        if not all_heights: return {}
         
-        # 2. 准备投影直方图
-        all_ys = [p['rot_y'] for p in props]
-        all_hs = [p['h'] for p in props]
-        avg_h = np.median(all_hs) if all_hs else 30
+        # 使用 75分位数高度作为参考 (大苗标准)
+        median_h = np.percentile(all_heights, 75)
         
-        min_y, max_y = min(all_ys), max(all_ys)
-        # 放大分辨率，让直方图更细腻 (1像素 -> 2个bin)
-        resolution_scale = 2.0 
-        height_range = int((max_y - min_y + avg_h * 2) * resolution_scale)
-        y_hist = np.zeros(height_range + 100, dtype=np.float32)
-        
-        offset = (-min_y + avg_h) * resolution_scale
-        
-        for p in props:
-            # 累加区间：从 Top 到 Bottom
-            y_start = int((p['rot_top'] * resolution_scale) + offset)
-            y_end = int((p['rot_bottom'] * resolution_scale) + offset)
-            
-            y_start = max(0, min(y_start, len(y_hist)-1))
-            y_end = max(0, min(y_end, len(y_hist)-1))
-            
-            # 权重优化：用框的面积或者宽度，让大苗更有话语权
-            weight = p['w']
-            y_hist[y_start:y_end] += weight
-            
-        # 3. [关键优化] 高斯平滑
-        # sigma 决定了“模糊”程度。
-        # 太小 -> 一行变两行；太大 -> 两行并一行。
-        # 经验值：sigma = 苗高的 0.25 倍左右最合适
-        sigma = (avg_h * resolution_scale) * 0.25
-        y_hist_smooth = gaussian_filter1d(y_hist, sigma)
-        
-        # 4. [关键优化] 寻找波峰
-        # distance: 两个峰之间的最小距离。设为 0.6 倍株高，防止把紧挨着的两行漏掉
-        min_dist = (avg_h * resolution_scale) * 0.6
-        # prominence: 突起程度。滤除那些像杂草一样的平缓小包
-        min_prominence = np.max(y_hist_smooth) * 0.15
-        
-        peaks, _ = find_peaks(y_hist_smooth, distance=min_dist, prominence=min_prominence)
-        
-        # 5. [兜底策略] 峰值合并 (Post-Merge)
-        # 如果 find_peaks 还是把一行分成了两个很近的峰，我们手动合一下
-        final_peak_centers = []
-        if len(peaks) > 0:
-            current_merge_group = [peaks[0]]
-            
-            for i in range(1, len(peaks)):
-                prev_p = peaks[i-1]
-                curr_p = peaks[i]
-                
-                # 如果两个峰距离小于 0.7 倍株高，认为是同一个宽行的两个肩
-                if (curr_p - prev_p) < (avg_h * resolution_scale * 0.7):
-                    current_merge_group.append(curr_p)
-                else:
-                    # 结算上一组
-                    final_peak_centers.append(np.mean(current_merge_group))
-                    current_merge_group = [curr_p]
-            # 结算最后一组
-            final_peak_centers.append(np.mean(current_merge_group))
-        else:
-            final_peak_centers = [np.mean(all_ys) * resolution_scale + offset]
+        # [核心参数] 换行阈值
+        # 经验值：0.6 倍苗高。
+        # 同一行的苗，Y中心抖动很难超过 0.6个高度。
+        # 如果超过了，大概率是下一行。
+        split_threshold = median_h * 0.6
 
-        # 还原回真实坐标
-        lane_centers = [(pk - offset) / resolution_scale for pk in final_peak_centers]
-        lane_centers = np.array(lane_centers)
+        # 3. 按 Y 轴中心排序 (从上到下)
+        items.sort(key=lambda x: x['cy'])
         
-        lanes = {i: [] for i in range(len(lane_centers))}
+        lanes = {}
+        current_lane_id = 1
         
-        # 6. 分配逻辑：寻找最近的波峰
-        # 增加一个拒识阈值：如果离哪个峰都太远(行间杂草)，就丢弃
-        valid_dist_limit = avg_h * 1.2
+        if not items: return {}
         
-        for p in props:
-            y = p['rot_y']
-            dists = np.abs(lane_centers - y)
-            nearest_idx = np.argmin(dists)
+        # 初始化第一行
+        lanes[current_lane_id] = [items[0]]
+        last_y = items[0]['cy']
+        
+        # 4. 扫描并切分
+        for i in range(1, len(items)):
+            curr = items[i]
+            diff = curr['cy'] - last_y
             
-            if dists[nearest_idx] < valid_dist_limit:
-                lanes[nearest_idx].append(p)
-        
-        # 7. 过滤空行或极少行
-        final_lanes = {}
-        idx_cnt = 0
-        sorted_ids = sorted(lanes.keys())
-        for lid in sorted_ids:
-            if len(lanes[lid]) >= 3: # 至少3棵苗才算一行
-                final_lanes[idx_cnt] = lanes[lid]
-                idx_cnt += 1
+            if diff > split_threshold:
+                # 距离太远，判定为新的一行
+                current_lane_id += 1
+                lanes[current_lane_id] = []
+                # 重置基准Y (新行的第一个苗)
+                last_y = curr['cy'] 
+            else:
+                # 距离很近，判定为同一行
+                # 更新 last_y：使用滑动平均或直接用当前的，这里用当前的可以让行稍微弯曲
+                # 但为了防止漂移，最好还是跟这一行的均值比，或者只在换行时重置。
+                # 简单且鲁棒的方法：只有换行才重置 last_y？
+                # 不，为了适应稍微倾斜的行，我们应该更新 last_y，但不能更新太快。
+                # 这里采用：如果归入当前行，就不更新 last_y (以行首为准)，
+                # 或者更新 last_y (允许行倾斜)。
+                # 考虑到 user 说 raw_boxes 是 rectify 过的 (Angle=0)，行是平的。
+                # 所以我们 **不更新 last_y**，始终和这一行的“平均水平”或“行首”比较。
                 
-        return final_lanes
+                # 修正策略：始终和当前行的【平均Y】比较可能更稳，
+                # 但简单起见，既然排好序了，和上一个归入该行的苗比较也行，
+                # 只是要注意 diff 的累积。
+                
+                # 最稳妥方案：
+                # 只要 (curr_y - current_lane_avg_y) < threshold。
+                # 这里简化：如果 diff (和上一个 sorted item) 很大，就断开。
+                pass # 逻辑已经在 if 里处理了
+
+            lanes[current_lane_id].append(curr)
+            
+            # [关键微调] 
+            # 如果我们不更新 last_y，那么 split_threshold 需要大一点 (行宽的一半)。
+            # 如果我们更新 last_y = curr['cy']，那么 split_threshold 就是“行间隙”。
+            # 这种情况下，更新 last_y 容易导致把紧挨着的两行粘连。
+            # 
+            # 最优解：**不要更新 last_y**。
+            # last_y 应该代表“当前行的重心”。
+            # 随着新苗加入，动态更新当前行的重心。
+            current_lane_objs = lanes[current_lane_id]
+            lane_ys = [p['cy'] for p in current_lane_objs]
+            last_y = np.mean(lane_ys) # 始终和当前行的平均线比较
+
+        return lanes
 
     def check_collision(self, virtual_box, all_boxes):
         """物理碰撞检测"""
