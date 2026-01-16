@@ -70,22 +70,6 @@ class ForcedAlignmentDetector:
             ])
         return np.array(boxes), width, height
 
-    def find_optimal_angle(self, boxes):
-        """矫正角度"""
-        if len(boxes) < 2: return 0.0
-        centers = (boxes[:, :2] + boxes[:, 2:]) / 2
-        bias = np.mean(centers, axis=0)
-        def cost(a):
-            ar = np.radians(a)
-            c, s = np.cos(ar), np.sin(ar)
-            rot_x = (centers[:, 0] - bias[0])*c - (centers[:, 1] - bias[1])*s
-            # 使用差分和最小化，让行更紧凑
-            sx = np.sort(rot_x)
-            diffs = np.diff(sx)
-            return np.sum(diffs[:int(len(diffs)*0.8)])
-        res = minimize_scalar(cost, bounds=(-60, 60), method='bounded')
-        return res.x
-
     def get_rotated_data(self, boxes, angle):
         """获取旋转属性"""
         if len(boxes) == 0: return []
@@ -121,63 +105,6 @@ class ForcedAlignmentDetector:
                 'rot_bottom': p_bottom[1]
             })
         return props
-
-    def calculate_global_angle(self, boxes):
-        """
-        [核心升级] 使用霍夫变换 (Hough Transform) 计算全局垄行倾斜角。
-        不管苗怎么缺，只要整体是成行的，这个方法就能把角度算准。
-        """
-        if len(boxes) < 5: return 0.0
-        
-        # 1. 创建一张空的“点图”
-        # 映射到一个 1000x1000 的虚拟画布上，方便计算
-        canvas_size = 1000
-        mask = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
-        
-        # 归一化坐标到画布
-        xs = boxes[:, 0::2].mean(axis=1) # center x
-        ys = boxes[:, 1::2].mean(axis=1) # center y
-        
-        min_x, max_x = xs.min(), xs.max()
-        min_y, max_y = ys.min(), ys.max()
-        
-        if max_x == min_x or max_y == min_y: return 0.0
-        
-        # 把点画上去
-        for x, y in zip(xs, ys):
-            nx = int((x - min_x) / (max_x - min_x) * (canvas_size - 10)) + 5
-            ny = int((y - min_y) / (max_y - min_y) * (canvas_size - 10)) + 5
-            # 画大一点的圆，让霍夫变换更容易捕捉到“线”
-            cv2.circle(mask, (nx, ny), 4, 255, -1)
-            
-        # 2. 霍夫线变换
-        # 精度：1度，1像素；阈值：看点的数量，至少要有10%的点共线
-        threshold = max(5, int(len(boxes) * 0.1))
-        lines = cv2.HoughLines(mask, 1, np.pi / 180, threshold)
-        
-        if lines is None: return 0.0
-        
-        # 3. 统计所有检测到的线的角度
-        angles = []
-        for line in lines:
-            rho, theta = line[0]
-            # theta 是弧度，0是垂直线，pi/2是水平线
-            # 我们要的是偏离水平的角度
-            # 转换为角度 (0-180)
-            deg = np.degrees(theta)
-            
-            # 霍夫变换出来的水平线角度通常接近 90 度
-            # 我们将其转换为相对于水平线 (0度) 的偏离角 (-90 到 90)
-            diff = deg - 90
-            
-            # 过滤掉太离谱的角度（比如检测到了竖线），只看水平附近的 (-45 到 45)
-            if abs(diff) < 45:
-                angles.append(diff)
-                
-        if not angles: return 0.0
-        
-        # 取中位数，消除噪点干扰
-        return np.median(angles)
 
     def assign_lanes_forced(self, raw_boxes):
         """
@@ -216,7 +143,7 @@ class ForcedAlignmentDetector:
         # 经验值：0.6 倍苗高。
         # 同一行的苗，Y中心抖动很难超过 0.6个高度。
         # 如果超过了，大概率是下一行。
-        split_threshold = median_h * 0.6
+        split_threshold = median_h * 0.8
 
         # 3. 按 Y 轴中心排序 (从上到下)
         items.sort(key=lambda x: x['cy'])
@@ -286,49 +213,6 @@ class ForcedAlignmentDetector:
             xx2 = min(vx2, bx2); yy2 = min(vy2, by2)
             if xx2 > xx1 and yy2 > yy1: return True
         return False
-
-    def calculate_lane_paces(self, lanes):
-        """
-        [新增] 计算每一行的局部节奏 (Local Pace)
-        解决"忽快忽慢"和"株高不等于株距"的问题
-        """
-        lane_paces = {}
-        all_diffs = []
-        
-        # 1. 先算每一行的中位间距
-        for lid, items in lanes.items():
-            if len(items) < 3: 
-                lane_paces[lid] = None 
-                continue
-                
-            items.sort(key=lambda x: x['rot_y'])
-            ys = np.array([p['rot_y'] for p in items])
-            diffs = np.diff(ys)
-            
-            # 过滤掉明显的离群值（比如巨大的缺苗空档）
-            # 只取 0.5倍 到 1.5倍 中位数的间距参与统计
-            raw_med = np.median(diffs)
-            valid_diffs = diffs[(diffs > raw_med * 0.5) & (diffs < raw_med * 1.5)]
-            
-            if len(valid_diffs) > 0:
-                local_pace = np.median(valid_diffs)
-                lane_paces[lid] = local_pace
-                all_diffs.extend(valid_diffs)
-            else:
-                lane_paces[lid] = None
-
-        # 2. 计算一个全局兜底值
-        if len(all_diffs) > 0:
-            global_fallback = np.median(all_diffs)
-        else:
-            global_fallback = 50.0 
-            
-        # 3. 填补那些没算出来的行
-        for lid in lanes.keys():
-            if lane_paces.get(lid) is None:
-                lane_paces[lid] = global_fallback
-                
-        return lane_paces
 
     def process(self, raw_boxes, img_w, img_h):
         """
