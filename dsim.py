@@ -16,8 +16,8 @@ class Config:
     
     IMAGE_DIR_NAME = "VOCdevkit/VOC2007/JPEGImages"
     LABEL_DIR_NAME = "VOCdevkit/VOC2007/Annotations"
-    TXT_FILE_NAME = "VOCdevkit/VOC2007/ImageSets/Main/val.txt"
-    OUTPUT_DIR_NAME = "output_dynamic" # 输出文件夹改个名区分一下
+    TXT_FILE_NAME = "VOCdevkit/VOC2007/ImageSets/Main/trainval.txt"
+    OUTPUT_DIR_NAME = "output_dynamic_new" # 输出文件夹改个名区分一下
     
     # ------------------- [1] 缺苗判定参数 -------------------
     # 判定阈值：物理空隙 > 平均株高 * 此倍数
@@ -332,18 +332,21 @@ class ForcedAlignmentDetector:
 
     def process(self, raw_boxes, img_w, img_h):
         """
-        [全域互斥 + 优先级版]
+        [绝对隔离版 - 四面强制留空]
         
-        解决用户痛点：
-        1. 防止缺苗框互相重叠 (Vertical Collision of Missing Boxes)。
-        2. 引入两轮扫描机制 (Two-Pass Strategy)：
-           - Pass 1: 优先计算“补中 (Body)”，确保行内缺苗先占坑。
-           - Pass 2: 后计算“补头/尾 (Head/Tail)”，防止边缘延伸出的红叉覆盖了正常的缺苗。
-        3. 实时更新障碍物列表：生成的缺苗立刻变为障碍物，后续检测必须避开它。
+        核心升级：
+        1. 膨胀碰撞检测 (Inflated Collision Check)：
+           在检查位置是否合法时，使用一个“向四周膨胀 15%”的隐形框去检测。
+           只要隐形框碰到了任何东西，就视为位置太挤，拒绝放置。
+           这保证了最终的红框四周都有 15% 的物理留空。
+        
+        2. 漂移控制：
+           基准线：np.polyfit 拟合的中心直线。
+           漂移量：允许上下浮动 30% (nudge_range) 来适应微小的地形起伏。
         """
         if len(raw_boxes) < 2: return [], [], 0
         
-        # 1. 基础数据与分行
+        # 1. 基础流程
         angle = 0.0 
         props = self.get_rotated_data(raw_boxes, angle)
         lanes = self.assign_lanes_forced(raw_boxes)
@@ -351,18 +354,12 @@ class ForcedAlignmentDetector:
         final_missing = []
         labels = np.zeros(len(raw_boxes), dtype=int)
         
-        # --- [步骤 A] 准备统计数据 ---
-        all_widths = [p['w'] for p in props]
+        # --- 尺寸统计 (P75 高度) ---
         all_heights = [p['h'] for p in props]
-        if not all_widths: return [], [], 0
+        if not all_heights: return [], [], 0
+        global_p75_h = np.percentile(all_heights, 95)
 
-        # 标准尺寸 (P75 大苗标准)
-        p75_w = np.percentile(all_widths, 75)
-        p75_h = np.percentile(all_heights, 75)
-        virtual_size = max(p75_w, p75_h)
-        size_tolerance = 0.85
-        
-        # 统计全田边界 (用于补头/尾)
+        # 统计边界
         lane_starts = []
         lane_ends = []
         for lid, items in lanes.items():
@@ -372,156 +369,192 @@ class ForcedAlignmentDetector:
             lane_ends.append(items[-1]['rot_x'] + items[-1]['w'] / 2)
             
         if not lane_starts: return [], [], 0
-        
         global_start_x = np.percentile(lane_starts, 25)
         global_end_x = np.percentile(lane_ends, 75)
         
-        # 抖动探测参数
-        nudge_range = virtual_size * 0.25
-        nudge_offsets = [0, -nudge_range * 0.5, nudge_range * 0.5, -nudge_range, nudge_range]
-
-        # 动态障碍物列表 (存放新生成的红叉)
         generated_obstacles = []
 
-        # --- [辅助函数] 严格校验位置是否合法 ---
-        def is_location_valid(box):
-            # 1. 越界检查
-            margin = 2
-            if (box[0] < -margin or box[1] < -margin or 
-                box[2] > img_w + margin or box[3] > img_h + margin):
+        # --- [核心修改] 膨胀版碰撞检测 ---
+        def is_location_valid(box, margin_pixels):
+            """
+            box: [xmin, ymin, xmax, ymax] (实际要画的框)
+            margin_pixels: 强制留空的像素距离 (四面都要留)
+            """
+            # 1. 越界检查 (检查实际框是否出界)
+            # 允许框贴着图片边缘，但不允许出去
+            if (box[0] < 0 or box[1] < 0 or 
+                box[2] > img_w or box[3] > img_h):
                 return False
+
+            # 2. 构造“膨胀框” (Inflated Box)
+            # 我们用这个大一圈的框去探测障碍物
+            expanded_box = [
+                box[0] - margin_pixels, # 左扩
+                box[1] - margin_pixels, # 上扩
+                box[2] + margin_pixels, # 右扩
+                box[3] + margin_pixels  # 下扩
+            ]
             
-            # 2. 撞真苗检查
-            if self.check_collision(box, raw_boxes):
+            # 3. 撞真苗检查 (用膨胀框去撞)
+            # 如果膨胀框撞到了真苗，说明真苗在安全距离内 -> 拒绝
+            if self.check_collision(expanded_box, raw_boxes):
                 return False
                 
-            # 3. 撞新苗检查
+            # 4. 撞新苗检查 (用膨胀框去撞)
+            # 如果膨胀框撞到了其他红框，说明离得太近 -> 拒绝
             for ob in generated_obstacles:
-                if not (box[2] < ob[0] or box[0] > ob[2] or box[3] < ob[1] or box[1] > ob[3]):
+                if not (expanded_box[2] < ob[0] or expanded_box[0] > ob[2] or 
+                        expanded_box[3] < ob[1] or expanded_box[1] > ob[3]):
                     return False
+            
             return True
 
-        # --- [内部函数] 填空逻辑 (含平移避让) ---
-        def fill_gap_between(start_edge, end_edge, base_y):
+        # --- 填空函数 ---
+        def fill_gap_between(start_edge, end_edge, slope, intercept, virtual_size):
             current_edge = start_edge
             
-            while end_edge - current_edge >= virtual_size * size_tolerance:
-                virtual_cx = current_edge + virtual_size / 2
+            # [定义安全距离]
+            # 四周都要留出 20% 的空隙
+            safety_margin = virtual_size * 0.20
+            
+            # X轴步进策略：
+            # 必须留出：左margin + 框 + 右margin
+            step_width = virtual_size + 2 * safety_margin
+            
+            # 循环条件：剩余空间必须 > step_width
+            while end_edge - current_edge >= step_width:
+                
+                # 计算 X 中心：
+                # 当前边缘 + 左安全距离 + 半个框宽
+                virtual_cx = current_edge + safety_margin + virtual_size / 2
+                
+                # 再次检查右边界：
+                # 框的右边 + 右安全距离 必须 < 终点
+                if virtual_cx + virtual_size/2 + safety_margin > end_edge:
+                    break
+                
+                # 计算 Y 中心：基于线性拟合
+                target_y = slope * virtual_cx + intercept
                 
                 placed_success = False
                 final_vbox = None
                 
-                # 遍历抖动位置
+                # [漂移设置]
+                # 允许上下浮动 30% 的高度去寻找不碰的位置
+                nudge_range = virtual_size * 0.3
+                nudge_offsets = [0, -nudge_range * 0.5, nudge_range * 0.5, -nudge_range, nudge_range]
+                
                 for offset_y in nudge_offsets:
-                    test_y = base_y + offset_y
+                    test_y = target_y + offset_y
                     
                     vw, vh = virtual_size, virtual_size
-                    scale = 0.9
-                    # 初始尝试框
-                    vbox = [virtual_cx - vw*scale/2, test_y - vh*scale/2, 
-                            virtual_cx + vw*scale/2, test_y + vh*scale/2]
+                    # 虚拟框本身
+                    vbox = [virtual_cx - vw/2, test_y - vh/2, 
+                            virtual_cx + vw/2, test_y + vh/2]
                     
-                    # === 尝试 1: 直接检查当前位置 ===
-                    if is_location_valid(vbox):
+                    # 1. 严格检查 (传入 safety_margin)
+                    if is_location_valid(vbox, safety_margin):
                         placed_success = True
                         final_vbox = vbox
                         break
                     
-                    # === 尝试 2: 如果撞了真苗，尝试上下平移避让 ===
-                    # 找出撞到了哪个框，尝试躲避它
+                    # 2. 智能避让 (平移)
+                    # 避让逻辑依然尝试寻找空位
                     collision_found = False
                     shifted_vbox = None
-                    
                     for rbox in raw_boxes:
-                        # 简单的 AABB 碰撞判断
+                        # 这里用 Expanded Box 逻辑太复杂，我们先检测直接碰撞，再微调
+                        # 为了简化计算，避让依然基于原始框，但校验时使用严格标准
                         if (vbox[0] < rbox[2] and vbox[2] > rbox[0] and 
                             vbox[1] < rbox[3] and vbox[3] > rbox[1]):
-                            
-                            # 发生了碰撞，分析方向
                             rbox_ymin, rbox_ymax = rbox[1], rbox[3]
                             vbox_ymin, vbox_ymax = vbox[1], vbox[3]
-                            
-                            # Case A: 底部碰撞 (虚拟框的底部 戳进了 真实框的顶部)
-                            # 判定：虚拟框中心比真实框中心更靠上，且下边缘重叠
-                            if (vbox_ymin + vbox_ymax)/2 < (rbox_ymin + rbox_ymax)/2:
-                                # 策略：向上移动 (Shift UP)
-                                # 目标：让虚拟框底部 = 真实框顶部 - 1px (留点缝隙)
-                                shift_dist = vbox_ymax - rbox_ymin + 1
-                                # 限制最大移动距离 (不能为了躲避跑太远)
-                                if shift_dist < vh * 0.5:
-                                    shifted_vbox = [vbox[0], vbox[1] - shift_dist, 
-                                                    vbox[2], vbox[3] - shift_dist]
+                            if (vbox_ymin + vbox_ymax)/2 < (rbox_ymin + rbox_ymax)/2: # Bottom Hit
+                                # 往上躲，躲多远？躲到不接触为止 + 安全距离
+                                shift_dist = vbox_ymax - rbox_ymin + 1 + safety_margin
+                                if shift_dist < vh * 0.6: # 允许最大移动 60%
+                                    shifted_vbox = [vbox[0], vbox[1] - shift_dist, vbox[2], vbox[3] - shift_dist]
                                     collision_found = True
-                            
-                            # Case B: 顶部碰撞 (虚拟框的顶部 戳进了 真实框的底部)
-                            # 判定：虚拟框中心比真实框中心更靠下，且上边缘重叠
-                            else:
-                                # 策略：向下移动 (Shift DOWN)
-                                # 目标：让虚拟框顶部 = 真实框底部 + 1px
-                                shift_dist = rbox_ymax - vbox_ymin + 1
-                                if shift_dist < vh * 0.5:
-                                    shifted_vbox = [vbox[0], vbox[1] + shift_dist, 
-                                                    vbox[2], vbox[3] + shift_dist]
+                            else: # Top Hit
+                                shift_dist = rbox_ymax - vbox_ymin + 1 + safety_margin
+                                if shift_dist < vh * 0.6:
+                                    shifted_vbox = [vbox[0], vbox[1] + shift_dist, vbox[2], vbox[3] + shift_dist]
                                     collision_found = True
-                            
-                            # 我们只处理第一个碰到的物体进行避让尝试
                             break 
                     
-                    # 如果刚才计算出了一个避让后的新框，必须再次校验它是否合法
-                    # (防止往上躲的时候撞到了上面的框，或者跑出了边界)
                     if collision_found and shifted_vbox is not None:
-                        if is_location_valid(shifted_vbox):
+                        # 避让后的新框，必须通过严格检查
+                        if is_location_valid(shifted_vbox, safety_margin):
                             placed_success = True
                             final_vbox = shifted_vbox
                             break
                 
-                # --- 结算 ---
                 if placed_success and final_vbox is not None:
-                    final_cy = (final_vbox[1] + final_vbox[3]) / 2
-                    final_missing.append([virtual_cx, final_cy])
-                    
+                    final_missing.append(final_vbox)
                     generated_obstacles.append(final_vbox)
-                    current_edge += virtual_size 
+                    # 成功后，推进：框宽 + 2倍安全距离 (保证下一个框从安全区外开始算)
+                    current_edge += step_width
                 else:
+                    # 失败后，只推进半个框宽试探
                     current_edge += virtual_size * 0.5
         
-        # --- [步骤 B] 优先级执行策略 ---
+        # --- 准备每行的拟合方程 ---
         lane_meta = {}
         for lid, items in lanes.items():
             if not items: continue
             for p in items: labels[p['id']] = lid
             items.sort(key=lambda x: x['rot_x'])
             
-            if len(items) >= 2:
-                row_mean_y = np.median([p['rot_y'] for p in items])
+            # 拟合直线
+            xs = [p['rot_x'] for p in items]
+            ys = [p['rot_y'] for p in items]
+            if len(xs) >= 2:
+                slope, intercept = np.polyfit(xs, ys, 1)
             else:
-                row_mean_y = items[0]['rot_y']
+                slope, intercept = 0.0, ys[0]
             
-            lane_meta[lid] = {'items': items, 'mean_y': row_mean_y}
+            # 尺寸计算
+            row_heights = [p['h'] for p in items]
+            row_median_h = np.max(row_heights)
+            final_row_size = (global_p75_h * 0.8) + (row_median_h * 0.2)
+            # final_row_size = global_p75_h
+            
+            lane_meta[lid] = {
+                'items': items, 
+                'slope': slope, 
+                'intercept': intercept, 
+                'virtual_size': final_row_size 
+            }
 
         # PASS 1: Body
         for lid, meta in lane_meta.items():
             items = meta['items']
+            v_size = meta['virtual_size']
+            slope = meta['slope']
+            intercept = meta['intercept']
             for k in range(len(items) - 1):
                 curr = items[k]
                 next_box = items[k+1]
-                curr_right = curr['rot_x'] + curr['w'] / 2
-                next_left = next_box['rot_x'] - next_box['w'] / 2
-                local_y = (curr['rot_y'] + next_box['rot_y']) / 2
-                fill_gap_between(curr_right, next_left, local_y)
+                fill_gap_between(
+                    curr['rot_x'] + curr['w'] / 2, 
+                    next_box['rot_x'] - next_box['w'] / 2, 
+                    slope, intercept, v_size
+                )
 
         # PASS 2: Head/Tail
         for lid, meta in lane_meta.items():
             items = meta['items']
-            row_mean_y = meta['mean_y']
-            # Head
+            v_size = meta['virtual_size']
+            slope = meta['slope']
+            intercept = meta['intercept']
+            
             first_left = items[0]['rot_x'] - items[0]['w'] / 2
-            if first_left > global_start_x + virtual_size * 0.5:
-                fill_gap_between(global_start_x, first_left, row_mean_y)
-            # Tail
+            if first_left > global_start_x + v_size * 0.5:
+                fill_gap_between(global_start_x, first_left, slope, intercept, v_size)
+            
             last_right = items[-1]['rot_x'] + items[-1]['w'] / 2
-            if last_right < global_end_x - virtual_size * 0.5:
-                fill_gap_between(last_right, global_end_x, row_mean_y)
+            if last_right < global_end_x - v_size * 0.5:
+                fill_gap_between(last_right, global_end_x, slope, intercept, v_size)
 
         return final_missing, labels, angle
 
@@ -577,19 +610,23 @@ def main():
             # cv2.putText(img, str(lid), (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         for pt in missing_pts:
-            cx, cy = int(pt[0]), int(pt[1])
-            w, h = 35, 35
-            # 画红色方框表示缺苗
-            cv2.rectangle(img, (cx-w//2, cy-h//2), (cx+w//2, cy+h//2), Config.MISSING_COLOR, 2)
-            # 画个叉
-            cv2.line(img, (cx-10, cy-10), (cx+10, cy+10), Config.MISSING_COLOR, 2)
-            cv2.line(img, (cx+10, cy-10), (cx-10, cy+10), Config.MISSING_COLOR, 2)
+            xmin, ymin, xmax, ymax = map(int, pt)
+            # cx, cy = int(pt[0]), int(pt[1])
+            # w, h = 35, 35
+            cv2.rectangle(img, (xmin, ymin), (xmax, ymax), Config.MISSING_COLOR, 3)
+            cv2.line(img, (xmin, ymin), (xmax, ymax), Config.MISSING_COLOR, 2)
+            cv2.line(img, (xmin, ymax), (xmax, ymin), Config.MISSING_COLOR, 2)
+            # # 画红色方框表示缺苗
+            # cv2.rectangle(img, (cx-w//2, cy-h//2), (cx+w//2, cy+h//2), Config.MISSING_COLOR, 2)
+            # # 画个叉
+            # cv2.line(img, (cx-10, cy-10), (cx+10, cy+10), Config.MISSING_COLOR, 2)
+            # cv2.line(img, (cx+10, cy-10), (cx-10, cy+10), Config.MISSING_COLOR, 2)
 
         info = f"Forced Align | Miss: {len(missing_pts)}"
         cv2.rectangle(img, (0, 0), (300, 30), (0,0,0), -1)
         cv2.putText(img, info, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
-        save_path = os.path.join(out_dir, stem + "_forced.jpg")
+        save_path = os.path.join(out_dir, stem + ".jpg")
         imwrite_safe(save_path, img)
 
     print("Done.")
